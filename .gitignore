@@ -4,3 +4,8 @@ Cargo.lock
 .DS_Store
 .idea/
 .vscode/
+
+# Claude
+CLAUDE.md
+.claude/
+_PROJECT.md
