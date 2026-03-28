@@ -1,0 +1,21 @@
+[package]
+name = "solidus-rpc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+solidus-crypto.workspace = true
+solidus-txns.workspace = true
+solidus-state.workspace = true
+solidus-consensus.workspace = true
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = { workspace = true }

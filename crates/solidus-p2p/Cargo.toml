@@ -1,0 +1,6 @@
+[package]
+name = "solidus-p2p"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

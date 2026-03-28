@@ -1,0 +1,12 @@
+[package]
+name = "solidus-txns"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+solidus-crypto.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
