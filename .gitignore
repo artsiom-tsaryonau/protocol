@@ -9,3 +9,7 @@ Cargo.lock
 CLAUDE.md
 .claude/
 _PROJECT.md
+
+# Internal planning docs
+apps/docs/
+docs/
