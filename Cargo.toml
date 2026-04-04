@@ -32,6 +32,8 @@ tokio = { version = "1", features = ["full"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 blake3 = "1"
 rand = "0.8"
+blst = "0.3"
+sha2 = "0.10"
 
 # Storage
 rocksdb = "0.22"
@@ -43,6 +45,11 @@ bincode = "1"
 
 # RPC
 jsonrpsee = { version = "0.24", features = ["server"] }
+
+# Networking
+libp2p = { version = "0.54", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "tokio", "macros", "ed25519"] }
+async-trait = "0.1"
+bitvec = { version = "1", features = ["serde"] }
 
 # Utilities
 tracing = "0.1"

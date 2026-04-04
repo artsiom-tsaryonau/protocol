@@ -8,11 +8,12 @@ use tracing::error;
 use solidus_consensus::mempool::Mempool;
 use solidus_consensus::types::Block;
 use solidus_crypto::keys::Address;
-use solidus_state::executor::load_account;
-use solidus_state::store::{Store, CF_BLOCKS, CF_RECEIPTS};
+use solidus_state::executor::{load_account, load_credential, load_credential_ids, load_validator};
+use solidus_state::store::{Store, CF_BLOCKS, CF_CRED_BY_ISSUER, CF_CRED_BY_SUBJECT, CF_RECEIPTS, CF_VALIDATORS};
+use solidus_txns::staking::ValidatorInfo;
 use solidus_txns::types::{Receipt, Transaction};
 
-use crate::types::{RpcBlock, RpcReceipt};
+use crate::types::{RpcBlock, RpcCredentialRecord, RpcCredentialVerifyResult, RpcDidDocument, RpcReceipt, RpcValidatorInfo};
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -66,6 +67,31 @@ pub trait SolidusApi {
     /// hex hash. Scans blocks backwards from latest — acceptable for testnet.
     #[method(name = "solidus_getTransaction")]
     fn get_transaction(&self, tx_hash: String) -> RpcResult<Option<serde_json::Value>>;
+
+    /// Resolve a DID and return its document, or `null` if not found.
+    #[method(name = "solidus_didResolve")]
+    fn did_resolve(&self, did: String) -> RpcResult<Option<RpcDidDocument>>;
+
+    /// Verify a credential by ID. Returns validity status and the credential
+    /// record, or `null` if the credential does not exist.
+    #[method(name = "solidus_credentialVerify")]
+    fn credential_verify(&self, credential_id: String) -> RpcResult<Option<RpcCredentialVerifyResult>>;
+
+    /// Return all credentials where the given DID is the subject.
+    #[method(name = "solidus_credentialsBySubject")]
+    fn credentials_by_subject(&self, did: String) -> RpcResult<Vec<RpcCredentialRecord>>;
+
+    /// Return all credentials where the given DID is the issuer.
+    #[method(name = "solidus_credentialsByIssuer")]
+    fn credentials_by_issuer(&self, did: String) -> RpcResult<Vec<RpcCredentialRecord>>;
+
+    /// Return all active validators.
+    #[method(name = "solidus_getValidators")]
+    fn get_validators(&self) -> RpcResult<Vec<RpcValidatorInfo>>;
+
+    /// Return validator info for a given base58 address, or `null` if not found.
+    #[method(name = "solidus_getValidatorStake")]
+    fn get_validator_stake(&self, address: String) -> RpcResult<Option<RpcValidatorInfo>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +245,67 @@ impl SolidusApiServer for SolidusRpcImpl {
         }
     }
 
+    fn did_resolve(&self, did: String) -> RpcResult<Option<RpcDidDocument>> {
+        use solidus_state::executor::load_did;
+        match load_did(&self.store, &did) {
+            Ok(Some(doc)) => Ok(Some(RpcDidDocument::from_did_document(&doc))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(internal_error(format!("store error: {e}"))),
+        }
+    }
+
+    fn credential_verify(&self, credential_id: String) -> RpcResult<Option<RpcCredentialVerifyResult>> {
+        match load_credential(&self.store, &credential_id) {
+            Ok(Some(cred)) => {
+                let revoked = cred.revoked;
+                let valid = !revoked;
+                let rpc_cred = RpcCredentialRecord::from_credential(&cred);
+                Ok(Some(RpcCredentialVerifyResult {
+                    valid,
+                    credential: Some(rpc_cred),
+                    revoked,
+                }))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(internal_error(format!("store error: {e}"))),
+        }
+    }
+
+    fn credentials_by_subject(&self, did: String) -> RpcResult<Vec<RpcCredentialRecord>> {
+        let ids = load_credential_ids(&self.store, CF_CRED_BY_SUBJECT, &did)
+            .map_err(|e| internal_error(format!("store error: {e}")))?;
+
+        let mut records = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match load_credential(&self.store, id) {
+                Ok(Some(cred)) => records.push(RpcCredentialRecord::from_credential(&cred)),
+                Ok(None) => {
+                    // Index references a missing record — skip (should not happen)
+                    error!("credential index references missing credential: {id}");
+                }
+                Err(e) => return Err(internal_error(format!("store error: {e}"))),
+            }
+        }
+        Ok(records)
+    }
+
+    fn credentials_by_issuer(&self, did: String) -> RpcResult<Vec<RpcCredentialRecord>> {
+        let ids = load_credential_ids(&self.store, CF_CRED_BY_ISSUER, &did)
+            .map_err(|e| internal_error(format!("store error: {e}")))?;
+
+        let mut records = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match load_credential(&self.store, id) {
+                Ok(Some(cred)) => records.push(RpcCredentialRecord::from_credential(&cred)),
+                Ok(None) => {
+                    error!("credential index references missing credential: {id}");
+                }
+                Err(e) => return Err(internal_error(format!("store error: {e}"))),
+            }
+        }
+        Ok(records)
+    }
+
     fn get_transaction(&self, tx_hash: String) -> RpcResult<Option<serde_json::Value>> {
         let hash_bytes = hex::decode(&tx_hash)
             .map_err(|e| invalid_params(format!("invalid hex hash: {e}")))?;
@@ -261,6 +348,47 @@ impl SolidusApiServer for SolidusRpcImpl {
         }
 
         Ok(None)
+    }
+
+    fn get_validator_stake(&self, address: String) -> RpcResult<Option<RpcValidatorInfo>> {
+        let addr = solidus_crypto::keys::Address::from_base58(&address)
+            .map_err(|e| invalid_params(format!("invalid address: {e}")))?;
+
+        match load_validator(&self.store, &addr) {
+            Ok(Some(info)) => Ok(Some(RpcValidatorInfo::from_validator(&info))),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                error!("failed to load validator {address}: {e}");
+                Err(internal_error(format!("store error: {e}")))
+            }
+        }
+    }
+
+    fn get_validators(&self) -> RpcResult<Vec<RpcValidatorInfo>> {
+        let db = self.store.inner();
+        let cf = db
+            .cf_handle(CF_VALIDATORS)
+            .ok_or_else(|| internal_error("CF not found: validators"))?;
+
+        let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut validators = Vec::new();
+        for item in iter {
+            let (_, value) = item.map_err(|e| {
+                error!("error iterating validators: {e}");
+                internal_error(e.to_string())
+            })?;
+            match ValidatorInfo::from_bytes(&value) {
+                Ok(info) if info.active => {
+                    validators.push(RpcValidatorInfo::from_validator(&info));
+                }
+                Ok(_) => {} // inactive validator — skip
+                Err(e) => {
+                    error!("failed to deserialize validator record: {e}");
+                    // Skip corrupt records rather than failing the whole call.
+                }
+            }
+        }
+        Ok(validators)
     }
 }
 
@@ -390,13 +518,17 @@ mod tests {
         let block = Block {
             header: BlockHeader {
                 height: 1,
+                round: 0,
                 parent_hash: [0u8; 32],
                 state_root: [0xAA; 32],
                 transactions_root: [0u8; 32],
                 timestamp_ms: 1_700_000_000_000,
                 tx_count: 0,
+                proposer: Address::from_bytes([0u8; 20]),
             },
             transactions: vec![],
+            parent_qc: None,
+            vrf_proof: None,
         };
         let data = serde_json::to_vec(&block).unwrap();
         store.put(CF_BLOCKS, &1u64.to_le_bytes(), &data).unwrap();
@@ -418,13 +550,17 @@ mod tests {
         let block = Block {
             header: BlockHeader {
                 height: 5,
+                round: 0,
                 parent_hash: [0u8; 32],
                 state_root: [0xBB; 32],
                 transactions_root: [0u8; 32],
                 timestamp_ms: 1_700_000_000_000,
                 tx_count: 0,
+                proposer: Address::from_bytes([0u8; 20]),
             },
             transactions: vec![],
+            parent_qc: None,
+            vrf_proof: None,
         };
         let data = serde_json::to_vec(&block).unwrap();
         store.put(CF_BLOCKS, &5u64.to_le_bytes(), &data).unwrap();
@@ -480,6 +616,39 @@ mod tests {
     }
 
     #[test]
+    fn did_resolve_missing() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let result = SolidusApiServer::did_resolve(
+            &rpc,
+            "did:solidus:testnet:nonexistent".to_string(),
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn did_resolve_after_store() {
+        use solidus_state::store::CF_DIDS;
+        use solidus_txns::did::build_did_document;
+
+        let (store, _dir) = open_tmp();
+        let did = "did:solidus:testnet:abc123";
+        let doc = build_did_document(did, "aabbcc", vec![], 1000);
+        store.put(CF_DIDS, did.as_bytes(), &doc.to_bytes()).unwrap();
+
+        let rpc = make_rpc(store);
+        let result = SolidusApiServer::did_resolve(&rpc, did.to_string()).unwrap();
+        assert!(result.is_some());
+
+        let rpc_doc = result.unwrap();
+        assert_eq!(rpc_doc.id, did);
+        assert!(rpc_doc.active);
+        assert_eq!(rpc_doc.created_ms, 1000);
+    }
+
+    #[test]
     fn get_transaction_scan_blocks() {
         let (store, _dir) = open_tmp();
 
@@ -492,13 +661,17 @@ mod tests {
         let block = Block {
             header: BlockHeader {
                 height: 2,
+                round: 0,
                 parent_hash: [0u8; 32],
                 state_root: [0u8; 32],
                 transactions_root: [0u8; 32],
                 timestamp_ms: 1_700_000_000_000,
                 tx_count: 1,
+                proposer: Address::from_bytes([0u8; 20]),
             },
             transactions: vec![tx],
+            parent_qc: None,
+            vrf_proof: None,
         };
         let data = serde_json::to_vec(&block).unwrap();
         store.put(CF_BLOCKS, &2u64.to_le_bytes(), &data).unwrap();
@@ -509,5 +682,118 @@ mod tests {
         let hash_hex = hex::encode(tx_hash);
         let result = rpc.get_transaction(hash_hex).unwrap();
         assert!(result.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential RPC tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn credential_verify_missing() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let result = SolidusApiServer::credential_verify(
+            &rpc,
+            "urn:solidus:credential:nonexistent".to_string(),
+        )
+        .unwrap();
+        assert!(result.is_none(), "missing credential should return None");
+    }
+
+    #[test]
+    fn credential_verify_after_store() {
+        use solidus_state::store::CF_CREDENTIALS;
+        use solidus_txns::credential::{CredentialRecord, CredentialType};
+
+        let (store, _dir) = open_tmp();
+
+        let cred = CredentialRecord {
+            id: "urn:solidus:credential:aabbcc".to_string(),
+            issuer_did: "did:solidus:testnet:issuer".to_string(),
+            subject_did: "did:solidus:testnet:subject".to_string(),
+            credential_type: CredentialType::Email,
+            hash: [0x11u8; 32],
+            issued_ms: 1_700_000_000_000,
+            revoked: false,
+            revoked_ms: None,
+        };
+        store
+            .put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes())
+            .unwrap();
+
+        let rpc = make_rpc(store);
+        let result = SolidusApiServer::credential_verify(
+            &rpc,
+            "urn:solidus:credential:aabbcc".to_string(),
+        )
+        .unwrap();
+
+        assert!(result.is_some(), "should find stored credential");
+        let verify = result.unwrap();
+        assert!(verify.valid, "credential should be valid (not revoked)");
+        assert!(!verify.revoked, "revoked flag should be false");
+        let rpc_cred = verify.credential.expect("credential field should be present");
+        assert_eq!(rpc_cred.id, "urn:solidus:credential:aabbcc");
+        assert_eq!(rpc_cred.hash, hex::encode([0x11u8; 32]));
+    }
+
+    #[test]
+    fn credentials_by_subject_empty() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let result = SolidusApiServer::credentials_by_subject(
+            &rpc,
+            "did:solidus:testnet:nobody".to_string(),
+        )
+        .unwrap();
+        assert!(result.is_empty(), "unknown DID should return empty list");
+    }
+
+    // -----------------------------------------------------------------------
+    // Validator RPC tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_validator_stake_missing() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let addr = Address::from_bytes([0xAB; 20]);
+        let result = SolidusApiServer::get_validator_stake(&rpc, addr.to_base58()).unwrap();
+        assert!(result.is_none(), "missing validator should return None");
+    }
+
+    #[test]
+    fn get_validator_stake_after_store() {
+        use solidus_state::store::CF_VALIDATORS;
+        use solidus_txns::staking::{ValidatorInfo, MIN_STAKE};
+
+        let (store, _dir) = open_tmp();
+
+        let addr = Address::from_bytes([0xCD; 20]);
+        let info = ValidatorInfo {
+            address: addr,
+            staked: MIN_STAKE,
+            unbonding: 0,
+            unbonding_start_ms: None,
+            reputation: 1000,
+            active: true,
+        };
+        store
+            .put(CF_VALIDATORS, addr.as_bytes(), &info.to_bytes())
+            .unwrap();
+
+        let rpc = make_rpc(store);
+        let result = SolidusApiServer::get_validator_stake(&rpc, addr.to_base58()).unwrap();
+        assert!(result.is_some(), "should find stored validator");
+
+        let rpc_info = result.unwrap();
+        assert_eq!(rpc_info.staked, MIN_STAKE);
+        assert!(rpc_info.active);
+        assert_eq!(rpc_info.reputation, 1000);
+        assert_eq!(rpc_info.unbonding, 0);
+        assert_eq!(rpc_info.address, addr.to_base58());
     }
 }

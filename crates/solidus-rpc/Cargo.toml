@@ -11,10 +11,12 @@ solidus-consensus.workspace = true
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 serde.workspace = true
 serde_json.workspace = true
+rocksdb.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+bs58.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

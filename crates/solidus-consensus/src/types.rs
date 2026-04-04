@@ -1,5 +1,9 @@
+use bitvec::prelude::*;
 use serde::{Deserialize, Serialize};
+use solidus_crypto::bls::{BlsPublicKey, BlsSignature};
 use solidus_crypto::hash::blake3_hash;
+use solidus_crypto::keys::Address;
+use solidus_crypto::vrf::VrfProof;
 use solidus_txns::types::Transaction;
 
 // ---------------------------------------------------------------------------
@@ -12,6 +16,8 @@ use solidus_txns::types::Transaction;
 pub struct BlockHeader {
     /// The sequential block number (0 = genesis).
     pub height: u64,
+    /// The consensus round in which this block was proposed.
+    pub round: u64,
     /// Hash of the parent block header (all zeros for genesis).
     pub parent_hash: [u8; 32],
     /// Global state root after executing all transactions in this block.
@@ -22,6 +28,8 @@ pub struct BlockHeader {
     pub timestamp_ms: u64,
     /// Number of transactions included in this block.
     pub tx_count: u32,
+    /// Address of the validator that proposed this block.
+    pub proposer: Address,
 }
 
 impl BlockHeader {
@@ -45,6 +53,10 @@ pub struct Block {
     pub header: BlockHeader,
     /// Ordered list of transactions included in this block.
     pub transactions: Vec<Transaction>,
+    /// Quorum certificate from the parent block (None for genesis).
+    pub parent_qc: Option<QuorumCertificate>,
+    /// VRF proof from the proposer for leader election (None for genesis / single-node).
+    pub vrf_proof: Option<VrfProof>,
 }
 
 impl Block {
@@ -75,6 +87,102 @@ pub fn compute_transactions_root(transactions: &[Transaction]) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
+// ValidatorIdentity
+// ---------------------------------------------------------------------------
+
+/// Identity of a validator in the consensus committee.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorIdentity {
+    /// The validator's on-chain address.
+    pub address: Address,
+    /// The validator's Ed25519 public key (32 bytes).
+    pub ed25519_pubkey: [u8; 32],
+    /// The validator's BLS12-381 public key for aggregate signatures.
+    pub bls_pubkey: BlsPublicKey,
+}
+
+// ---------------------------------------------------------------------------
+// Vote
+// ---------------------------------------------------------------------------
+
+/// A validator's vote on a proposed block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Vote {
+    /// Hash of the block being voted on.
+    pub block_hash: [u8; 32],
+    /// The consensus round of the vote.
+    pub round: u64,
+    /// Index of the voter in the committee.
+    pub voter_index: usize,
+    /// BLS signature over the block hash.
+    pub bls_signature: BlsSignature,
+}
+
+// ---------------------------------------------------------------------------
+// QuorumCertificate
+// ---------------------------------------------------------------------------
+
+/// Quorum Certificate — aggregated proof that >= quorum validators voted for a block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuorumCertificate {
+    /// Hash of the certified block.
+    pub block_hash: [u8; 32],
+    /// The consensus round.
+    pub round: u64,
+    /// Aggregated BLS signature from all signers.
+    pub aggregate_sig: BlsSignature,
+    /// Bitvector indicating which committee members signed.
+    pub signers: BitVec<u8, Msb0>,
+}
+
+impl QuorumCertificate {
+    /// Return the number of validators that signed this QC.
+    pub fn signer_count(&self) -> usize {
+        self.signers.count_ones()
+    }
+
+    /// Compute the content-address of this QC.
+    pub fn hash(&self) -> [u8; 32] {
+        let bytes = serde_json::to_vec(self).expect("QC serializable");
+        blake3_hash(&bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TimeoutVote
+// ---------------------------------------------------------------------------
+
+/// A validator's timeout vote when no QC is received in time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutVote {
+    /// The round that timed out.
+    pub round: u64,
+    /// Index of the voter in the committee.
+    pub voter_index: usize,
+    /// The highest QC the voter has seen (if any).
+    pub highest_qc: Option<QuorumCertificate>,
+    /// BLS signature over the timeout message.
+    pub bls_signature: BlsSignature,
+}
+
+// ---------------------------------------------------------------------------
+// TimeoutCertificate
+// ---------------------------------------------------------------------------
+
+/// Timeout Certificate — proof that >= quorum validators timed out on a round.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutCertificate {
+    /// The round that timed out.
+    pub round: u64,
+    /// Aggregated BLS signature from all timeout voters.
+    pub aggregate_sig: BlsSignature,
+    /// Bitvector indicating which committee members sent timeout votes.
+    pub signers: BitVec<u8, Msb0>,
+    /// The highest QC seen among timeout voters (if any).
+    pub highest_qc: Option<QuorumCertificate>,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -92,11 +200,13 @@ mod tests {
     fn block_header_hash_deterministic() {
         let header = BlockHeader {
             height: 1,
+            round: 0,
             parent_hash: [0u8; 32],
             state_root: [1u8; 32],
             transactions_root: [2u8; 32],
             timestamp_ms: 1_700_000_000_000,
             tx_count: 5,
+            proposer: Address::from_bytes([0u8; 20]),
         };
 
         let h1 = header.hash();
@@ -107,5 +217,75 @@ mod tests {
         let mut header2 = header.clone();
         header2.height = 2;
         assert_ne!(header.hash(), header2.hash());
+    }
+
+    #[test]
+    fn qc_signer_count() {
+        use solidus_crypto::bls::BlsSecretKey;
+
+        let sk = BlsSecretKey::generate();
+        let sig = sk.sign(b"test");
+
+        // 4-member committee, 3 of which signed
+        let mut signers = bitvec![u8, Msb0; 0; 4];
+        signers.set(0, true);
+        signers.set(1, true);
+        signers.set(2, true);
+        // index 3 did not sign
+
+        let qc = QuorumCertificate {
+            block_hash: [0xAA; 32],
+            round: 1,
+            aggregate_sig: sig,
+            signers,
+        };
+
+        assert_eq!(qc.signer_count(), 3);
+    }
+
+    #[test]
+    fn qc_hash_deterministic() {
+        use solidus_crypto::bls::BlsSecretKey;
+
+        let sk = BlsSecretKey::generate();
+        let sig = sk.sign(b"determinism");
+
+        let mut signers = bitvec![u8, Msb0; 0; 4];
+        signers.set(0, true);
+        signers.set(2, true);
+
+        let qc = QuorumCertificate {
+            block_hash: [0xBB; 32],
+            round: 5,
+            aggregate_sig: sig,
+            signers,
+        };
+
+        let h1 = qc.hash();
+        let h2 = qc.hash();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn vote_serialization_roundtrip() {
+        use solidus_crypto::bls::BlsSecretKey;
+
+        let sk = BlsSecretKey::generate();
+        let sig = sk.sign(b"vote message");
+
+        let vote = Vote {
+            block_hash: [0xCC; 32],
+            round: 42,
+            voter_index: 7,
+            bls_signature: sig,
+        };
+
+        let json = serde_json::to_string(&vote).expect("serialize vote");
+        let deserialized: Vote = serde_json::from_str(&json).expect("deserialize vote");
+
+        assert_eq!(deserialized.block_hash, vote.block_hash);
+        assert_eq!(deserialized.round, vote.round);
+        assert_eq!(deserialized.voter_index, vote.voter_index);
+        assert_eq!(deserialized.bls_signature, vote.bls_signature);
     }
 }

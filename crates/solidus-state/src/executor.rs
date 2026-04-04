@@ -1,9 +1,12 @@
 use solidus_crypto::keys::Address;
+use solidus_txns::credential::{CredentialRecord, execute_credential_issue, execute_credential_revoke};
+use solidus_txns::did::{DidDocument, execute_did_create, execute_did_update, execute_did_deactivate};
+use solidus_txns::staking::{ValidatorInfo, execute_stake, execute_unstake};
 use solidus_txns::token::execute_transfer;
-use solidus_txns::types::{Receipt, Transaction, TxPayload, TxStatus};
+use solidus_txns::types::{Event, Receipt, Transaction, TxPayload, TxStatus};
 
 use crate::account::Account;
-use crate::store::{Store, StoreError, CF_ACCOUNTS, CF_RECEIPTS};
+use crate::store::{Store, StoreError, CF_ACCOUNTS, CF_CREDENTIALS, CF_CRED_BY_ISSUER, CF_CRED_BY_SUBJECT, CF_DIDS, CF_RECEIPTS, CF_VALIDATORS};
 
 // ---------------------------------------------------------------------------
 // Fee distribution constants
@@ -56,6 +59,67 @@ pub fn load_account(store: &Store, address: &Address) -> Result<Account, StoreEr
 /// Persist an account to the store under `CF_ACCOUNTS`.
 pub fn save_account(store: &Store, account: &Account) -> Result<(), StoreError> {
     store.put(CF_ACCOUNTS, account.address.as_bytes(), &account.to_bytes())
+}
+
+/// Load a DID document from the store. Returns `Ok(None)` if not found.
+pub fn load_did(store: &Store, did: &str) -> Result<Option<DidDocument>, StoreError> {
+    match store.get(CF_DIDS, did.as_bytes())? {
+        Some(bytes) => Ok(Some(
+            DidDocument::from_bytes(&bytes).map_err(|e| StoreError::Serde(e.to_string()))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Persist a DID document to the store under `CF_DIDS`.
+pub fn save_did(store: &Store, did: &str, doc: &DidDocument) -> Result<(), StoreError> {
+    store.put(CF_DIDS, did.as_bytes(), &doc.to_bytes())
+}
+
+/// Load a credential record from the store. Returns `Ok(None)` if not found.
+pub fn load_credential(store: &Store, credential_id: &str) -> Result<Option<CredentialRecord>, StoreError> {
+    match store.get(CF_CREDENTIALS, credential_id.as_bytes())? {
+        Some(bytes) => Ok(Some(
+            CredentialRecord::from_bytes(&bytes).map_err(|e| StoreError::Serde(e.to_string()))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Persist a credential record to the store under `CF_CREDENTIALS`.
+pub fn save_credential(store: &Store, cred: &CredentialRecord) -> Result<(), StoreError> {
+    store.put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes())
+}
+
+/// Load credential IDs from a secondary index (by subject or by issuer).
+pub fn load_credential_ids(store: &Store, cf: &str, key: &str) -> Result<Vec<String>, StoreError> {
+    match store.get(cf, key.as_bytes())? {
+        Some(bytes) => Ok(serde_json::from_slice(&bytes).map_err(|e| StoreError::Serde(e.to_string()))?),
+        None => Ok(vec![]),
+    }
+}
+
+/// Load a validator record from the store. Returns `Ok(None)` if not found.
+pub fn load_validator(store: &Store, address: &Address) -> Result<Option<ValidatorInfo>, StoreError> {
+    match store.get(CF_VALIDATORS, address.as_bytes())? {
+        Some(bytes) => Ok(Some(
+            ValidatorInfo::from_bytes(&bytes).map_err(|e| StoreError::Serde(e.to_string()))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Persist a validator record to the store under `CF_VALIDATORS`.
+pub fn save_validator(store: &Store, info: &ValidatorInfo) -> Result<(), StoreError> {
+    store.put(CF_VALIDATORS, info.address.as_bytes(), &info.to_bytes())
+}
+
+/// Append a credential ID to a secondary index.
+pub fn append_credential_index(store: &Store, cf: &str, key: &str, credential_id: &str) -> Result<(), StoreError> {
+    let mut ids = load_credential_ids(store, cf, key)?;
+    ids.push(credential_id.to_string());
+    let bytes = serde_json::to_vec(&ids).map_err(|e| StoreError::Serde(e.to_string()))?;
+    store.put(cf, key.as_bytes(), &bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +263,357 @@ pub fn execute_block(
                         let receipt = Receipt {
                             tx_hash,
                             status: TxStatus::Failed(token_err.to_string()),
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                }
+            }
+            TxPayload::DidCreate { ref public_key, ref service_endpoints } => {
+                let did_str = solidus_txns::did::build_did("testnet", &sender_addr);
+                let existing = load_did(store, &did_str).map_err(ExecutorError::Store)?;
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                match execute_did_create(
+                    &sender_addr,
+                    public_key,
+                    service_endpoints.clone(),
+                    existing.as_ref(),
+                    timestamp_ms,
+                    "testnet",
+                ) {
+                    Ok(result) => {
+                        save_did(store, &result.did, &result.document)
+                            .map_err(ExecutorError::Store)?;
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Success,
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![Event::DidCreated {
+                                did: result.did,
+                                controller: sender_addr,
+                            }],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                    Err(e) => {
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Failed(e.to_string()),
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                }
+            }
+            TxPayload::DidUpdate { ref did, ref patches } => {
+                let existing = load_did(store, did).map_err(ExecutorError::Store)?;
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                match execute_did_update(
+                    &sender_addr,
+                    did,
+                    patches,
+                    existing.as_ref(),
+                    timestamp_ms,
+                ) {
+                    Ok(updated_doc) => {
+                        save_did(store, did, &updated_doc).map_err(ExecutorError::Store)?;
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Success,
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![Event::DidUpdated { did: did.clone() }],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                    Err(e) => {
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Failed(e.to_string()),
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                }
+            }
+            TxPayload::CredentialIssue { ref subject_did, credential_type, hash } => {
+                let subject_did = subject_did.clone();
+                let credential_type = *credential_type;
+                let hash = *hash;
+
+                let issuer_did = solidus_txns::did::build_did("testnet", &sender_addr);
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                let issuer_doc = load_did(store, &issuer_did).map_err(ExecutorError::Store)?;
+                let subject_doc = load_did(store, &subject_did).map_err(ExecutorError::Store)?;
+
+                let issuer_active = issuer_doc.as_ref().map(|d| d.active).unwrap_or(false);
+                let subject_active = subject_doc.as_ref().map(|d| d.active).unwrap_or(false);
+
+                match execute_credential_issue(
+                    &issuer_did,
+                    &subject_did,
+                    credential_type,
+                    hash,
+                    issuer_active,
+                    subject_active,
+                    block_height,
+                    timestamp_ms,
+                ) {
+                    Ok(cred) => {
+                        let credential_id = cred.id.clone();
+                        let issuer_did_clone = cred.issuer_did.clone();
+                        let subject_did_clone = cred.subject_did.clone();
+
+                        save_credential(store, &cred).map_err(ExecutorError::Store)?;
+                        append_credential_index(store, CF_CRED_BY_SUBJECT, &subject_did_clone, &credential_id)
+                            .map_err(ExecutorError::Store)?;
+                        append_credential_index(store, CF_CRED_BY_ISSUER, &issuer_did_clone, &credential_id)
+                            .map_err(ExecutorError::Store)?;
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Success,
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![Event::CredentialIssued {
+                                credential_id,
+                                issuer: issuer_did_clone,
+                                subject: subject_did_clone,
+                            }],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                    Err(e) => {
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Failed(e.to_string()),
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                }
+            }
+            TxPayload::CredentialRevoke { ref credential_id } => {
+                let credential_id = credential_id.clone();
+                let sender_did = solidus_txns::did::build_did("testnet", &sender_addr);
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                let existing = load_credential(store, &credential_id).map_err(ExecutorError::Store)?;
+
+                match execute_credential_revoke(&sender_did, existing.as_ref(), timestamp_ms) {
+                    Ok(revoked_cred) => {
+                        let cred_id = revoked_cred.id.clone();
+                        save_credential(store, &revoked_cred).map_err(ExecutorError::Store)?;
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Success,
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![Event::CredentialRevoked {
+                                credential_id: cred_id,
+                            }],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                    Err(e) => {
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Failed(e.to_string()),
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                }
+            }
+            TxPayload::Stake { amount } => {
+                let amount = *amount;
+                let existing = load_validator(store, &sender_addr).map_err(ExecutorError::Store)?;
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let _ = timestamp_ms; // not needed for stake, but available for consistency
+
+                // Note: fee was already deducted from sender.balance above.
+                // execute_stake checks balance >= amount + fee, but since we already
+                // deducted the fee we pass fee=0 here.
+                match execute_stake(&sender_addr, amount, sender.balance, existing.as_ref(), 0) {
+                    Ok(validator_info) => {
+                        // Deduct staked amount from sender balance.
+                        sender.balance -= amount;
+                        save_account(store, &sender)?;
+                        save_validator(store, &validator_info).map_err(ExecutorError::Store)?;
+                        total_fees += fee;
+
+                        let total_stake = validator_info.staked;
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Success,
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![Event::Staked {
+                                validator: sender_addr,
+                                amount,
+                                total_stake,
+                            }],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                    Err(e) => {
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Failed(e.to_string()),
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                }
+            }
+            TxPayload::Unstake { amount } => {
+                let amount = *amount;
+                let existing = load_validator(store, &sender_addr).map_err(ExecutorError::Store)?;
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                match execute_unstake(amount, existing.as_ref(), timestamp_ms) {
+                    Ok(validator_info) => {
+                        // For MVP: credit unstaked tokens back to sender immediately.
+                        // The 21-day unbonding period is tracked in ValidatorInfo but not enforced yet.
+                        sender.balance += amount;
+                        save_account(store, &sender)?;
+                        save_validator(store, &validator_info).map_err(ExecutorError::Store)?;
+                        total_fees += fee;
+
+                        let remaining_stake = validator_info.staked;
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Success,
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![Event::Unstaked {
+                                validator: sender_addr,
+                                amount,
+                                remaining_stake,
+                            }],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                    Err(e) => {
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Failed(e.to_string()),
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                }
+            }
+            TxPayload::DidDeactivate { ref did } => {
+                let existing = load_did(store, did).map_err(ExecutorError::Store)?;
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                match execute_did_deactivate(
+                    &sender_addr,
+                    did,
+                    existing.as_ref(),
+                    timestamp_ms,
+                ) {
+                    Ok(deactivated_doc) => {
+                        save_did(store, did, &deactivated_doc).map_err(ExecutorError::Store)?;
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Success,
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![Event::DidDeactivated { did: did.clone() }],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                    Err(e) => {
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Failed(e.to_string()),
                             block_height,
                             fee_paid: fee,
                             events: vec![],
@@ -526,5 +941,512 @@ mod tests {
 
         let sender = load_account(&store, &sender_addr).expect("load sender failed");
         assert_eq!(sender.nonce, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // DID executor tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a signed DidCreate transaction.
+    fn make_did_create_tx(sender_key: &SigningKey, nonce: u64) -> Transaction {
+        let pubkey = sender_key.verifying_key().to_bytes();
+        let payload = TxPayload::DidCreate {
+            public_key: pubkey,
+            service_endpoints: vec![],
+        };
+
+        let mut tx = Transaction {
+            sender_pubkey: pubkey,
+            nonce,
+            payload,
+            signature: [0u8; 64],
+        };
+
+        let msg = tx.signing_bytes();
+        tx.signature = sign(sender_key, &msg);
+        tx
+    }
+
+    /// Helper: build a signed DidDeactivate transaction.
+    fn make_did_deactivate_tx(sender_key: &SigningKey, did: String, nonce: u64) -> Transaction {
+        let pubkey = sender_key.verifying_key().to_bytes();
+        let payload = TxPayload::DidDeactivate { did };
+
+        let mut tx = Transaction {
+            sender_pubkey: pubkey,
+            nonce,
+            payload,
+            signature: [0u8; 64],
+        };
+
+        let msg = tx.signing_bytes();
+        tx.signature = sign(sender_key, &msg);
+        tx
+    }
+
+    #[test]
+    fn did_create_via_executor() {
+        let (store, _dir) = open_tmp();
+
+        let sender_key = generate_signing_key();
+        let sender_addr = Address::from_public_key(&sender_key.verifying_key());
+
+        // Fund enough for DID create fee (100_000) plus some headroom.
+        fund_account(&store, sender_addr, 1_000_000);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        let tx = make_did_create_tx(&sender_key, 0);
+        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[])
+            .expect("execute_block failed");
+
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].status, TxStatus::Success);
+        assert_eq!(receipts[0].block_height, 1);
+        assert_eq!(receipts[0].events.len(), 1);
+
+        // Verify the DID document was stored.
+        let expected_did = solidus_txns::did::build_did("testnet", &sender_addr);
+        let stored = load_did(&store, &expected_did)
+            .expect("load_did failed")
+            .expect("DID should be stored");
+
+        assert_eq!(stored.id, expected_did);
+        assert!(stored.active);
+
+        // Verify sender nonce was incremented.
+        let sender = load_account(&store, &sender_addr).expect("load sender failed");
+        assert_eq!(sender.nonce, 1);
+    }
+
+    #[test]
+    fn did_create_duplicate_fails() {
+        let (store, _dir) = open_tmp();
+
+        let sender_key = generate_signing_key();
+        let sender_addr = Address::from_public_key(&sender_key.verifying_key());
+
+        // Fund enough for two DID create fees.
+        fund_account(&store, sender_addr, 2_000_000);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        // First create — should succeed.
+        let tx1 = make_did_create_tx(&sender_key, 0);
+        let receipts1 = execute_block(&store, &[tx1], 1, &treasury_addr, &[])
+            .expect("execute_block 1 failed");
+        assert_eq!(receipts1[0].status, TxStatus::Success);
+
+        // Second create with nonce=1 — should fail (DID already exists).
+        let tx2 = make_did_create_tx(&sender_key, 1);
+        let receipts2 = execute_block(&store, &[tx2], 2, &treasury_addr, &[])
+            .expect("execute_block 2 failed");
+
+        match &receipts2[0].status {
+            TxStatus::Failed(reason) => {
+                assert!(
+                    reason.contains("already exists"),
+                    "unexpected failure reason: {reason}"
+                );
+            }
+            TxStatus::Success => panic!("expected failure for duplicate DID create"),
+        }
+        // Fee is still paid even on failure.
+        assert!(receipts2[0].fee_paid > 0);
+    }
+
+    #[test]
+    fn did_deactivate_via_executor() {
+        let (store, _dir) = open_tmp();
+
+        let sender_key = generate_signing_key();
+        let sender_addr = Address::from_public_key(&sender_key.verifying_key());
+
+        // Fund enough for create + deactivate fees.
+        fund_account(&store, sender_addr, 2_000_000);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        // Step 1: Create the DID.
+        let tx_create = make_did_create_tx(&sender_key, 0);
+        let receipts_create = execute_block(&store, &[tx_create], 1, &treasury_addr, &[])
+            .expect("execute_block (create) failed");
+        assert_eq!(receipts_create[0].status, TxStatus::Success);
+
+        let expected_did = solidus_txns::did::build_did("testnet", &sender_addr);
+
+        // Step 2: Deactivate the DID.
+        let tx_deactivate = make_did_deactivate_tx(&sender_key, expected_did.clone(), 1);
+        let receipts_deactivate =
+            execute_block(&store, &[tx_deactivate], 2, &treasury_addr, &[])
+                .expect("execute_block (deactivate) failed");
+
+        assert_eq!(receipts_deactivate[0].status, TxStatus::Success);
+
+        // Verify the stored document is now inactive.
+        let stored = load_did(&store, &expected_did)
+            .expect("load_did failed")
+            .expect("DID should be stored");
+
+        assert!(!stored.active, "DID should be deactivated");
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential executor tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a signed CredentialIssue transaction.
+    fn make_credential_issue_tx(
+        sender_key: &SigningKey,
+        subject_did: String,
+        credential_type: solidus_txns::credential::CredentialType,
+        hash: [u8; 32],
+        nonce: u64,
+    ) -> Transaction {
+        let pubkey = sender_key.verifying_key().to_bytes();
+        let payload = TxPayload::CredentialIssue {
+            subject_did,
+            credential_type,
+            hash,
+        };
+
+        let mut tx = Transaction {
+            sender_pubkey: pubkey,
+            nonce,
+            payload,
+            signature: [0u8; 64],
+        };
+
+        let msg = tx.signing_bytes();
+        tx.signature = sign(sender_key, &msg);
+        tx
+    }
+
+    /// Helper: build a signed CredentialRevoke transaction.
+    fn make_credential_revoke_tx(
+        sender_key: &SigningKey,
+        credential_id: String,
+        nonce: u64,
+    ) -> Transaction {
+        let pubkey = sender_key.verifying_key().to_bytes();
+        let payload = TxPayload::CredentialRevoke { credential_id };
+
+        let mut tx = Transaction {
+            sender_pubkey: pubkey,
+            nonce,
+            payload,
+            signature: [0u8; 64],
+        };
+
+        let msg = tx.signing_bytes();
+        tx.signature = sign(sender_key, &msg);
+        tx
+    }
+
+    #[test]
+    fn credential_issue_via_executor() {
+        let (store, _dir) = open_tmp();
+
+        let issuer_key = generate_signing_key();
+        let subject_key = generate_signing_key();
+
+        let issuer_addr = Address::from_public_key(&issuer_key.verifying_key());
+        let subject_addr = Address::from_public_key(&subject_key.verifying_key());
+
+        // Fund issuer with enough for DID create + credential issue fees.
+        fund_account(&store, issuer_addr, 100_000_000);
+        // Fund subject with enough for DID create fee.
+        fund_account(&store, subject_addr, 1_000_000);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        // Step 1: Create issuer DID.
+        let tx_issuer_did = make_did_create_tx(&issuer_key, 0);
+        let receipts = execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[])
+            .expect("issuer DidCreate failed");
+        assert_eq!(receipts[0].status, TxStatus::Success, "issuer DID create should succeed");
+
+        // Step 2: Create subject DID.
+        let tx_subject_did = make_did_create_tx(&subject_key, 0);
+        let receipts = execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[])
+            .expect("subject DidCreate failed");
+        assert_eq!(receipts[0].status, TxStatus::Success, "subject DID create should succeed");
+
+        // Step 3: Issue credential.
+        let subject_did = solidus_txns::did::build_did("testnet", &subject_addr);
+        let hash = [0xdeu8; 32];
+        let tx_issue = make_credential_issue_tx(
+            &issuer_key,
+            subject_did.clone(),
+            solidus_txns::credential::CredentialType::Email,
+            hash,
+            1, // issuer nonce=1 after DidCreate
+        );
+        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[])
+            .expect("CredentialIssue execute_block failed");
+
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].status,
+            TxStatus::Success,
+            "CredentialIssue should succeed; got: {:?}",
+            receipts[0].status
+        );
+        assert_eq!(receipts[0].events.len(), 1);
+
+        // Verify the credential ID from the event.
+        let credential_id = match &receipts[0].events[0] {
+            solidus_txns::types::Event::CredentialIssued { credential_id, .. } => credential_id.clone(),
+            other => panic!("expected CredentialIssued event, got: {:?}", other),
+        };
+
+        // Verify credential is stored.
+        let stored = load_credential(&store, &credential_id)
+            .expect("load_credential failed")
+            .expect("credential should be stored");
+
+        assert_eq!(stored.id, credential_id);
+        assert!(!stored.revoked, "credential should not be revoked");
+        assert_eq!(stored.credential_type, solidus_txns::credential::CredentialType::Email);
+        assert_eq!(stored.hash, hash);
+
+        // Verify secondary indexes.
+        let issuer_did = solidus_txns::did::build_did("testnet", &issuer_addr);
+        let by_subject = load_credential_ids(&store, CF_CRED_BY_SUBJECT, &subject_did)
+            .expect("load by subject failed");
+        assert!(by_subject.contains(&credential_id), "subject index should contain credential");
+
+        let by_issuer = load_credential_ids(&store, CF_CRED_BY_ISSUER, &issuer_did)
+            .expect("load by issuer failed");
+        assert!(by_issuer.contains(&credential_id), "issuer index should contain credential");
+    }
+
+    #[test]
+    fn credential_revoke_via_executor() {
+        let (store, _dir) = open_tmp();
+
+        let issuer_key = generate_signing_key();
+        let subject_key = generate_signing_key();
+
+        let issuer_addr = Address::from_public_key(&issuer_key.verifying_key());
+        let subject_addr = Address::from_public_key(&subject_key.verifying_key());
+
+        // Fund accounts.
+        fund_account(&store, issuer_addr, 100_000_000);
+        fund_account(&store, subject_addr, 1_000_000);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        // Create issuer DID.
+        let tx_issuer_did = make_did_create_tx(&issuer_key, 0);
+        execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[])
+            .expect("issuer DidCreate failed");
+
+        // Create subject DID.
+        let tx_subject_did = make_did_create_tx(&subject_key, 0);
+        execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[])
+            .expect("subject DidCreate failed");
+
+        // Issue credential (issuer nonce=1).
+        let subject_did = solidus_txns::did::build_did("testnet", &subject_addr);
+        let hash = [0xabu8; 32];
+        let tx_issue = make_credential_issue_tx(
+            &issuer_key,
+            subject_did,
+            solidus_txns::credential::CredentialType::Phone,
+            hash,
+            1,
+        );
+        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[])
+            .expect("CredentialIssue failed");
+        assert_eq!(receipts[0].status, TxStatus::Success);
+
+        let credential_id = match &receipts[0].events[0] {
+            solidus_txns::types::Event::CredentialIssued { credential_id, .. } => credential_id.clone(),
+            other => panic!("expected CredentialIssued event, got: {:?}", other),
+        };
+
+        // Revoke the credential (issuer nonce=2).
+        let tx_revoke = make_credential_revoke_tx(&issuer_key, credential_id.clone(), 2);
+        let receipts = execute_block(&store, &[tx_revoke], 4, &treasury_addr, &[])
+            .expect("CredentialRevoke failed");
+
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].status,
+            TxStatus::Success,
+            "CredentialRevoke should succeed; got: {:?}",
+            receipts[0].status
+        );
+
+        // Verify the stored credential is now revoked.
+        let stored = load_credential(&store, &credential_id)
+            .expect("load_credential failed")
+            .expect("credential should still be stored");
+
+        assert!(stored.revoked, "credential should be marked revoked");
+        assert!(stored.revoked_ms.is_some(), "revoked_ms should be set");
+    }
+
+    // -----------------------------------------------------------------------
+    // Staking executor tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a signed Stake transaction.
+    fn make_stake_tx(sender_key: &SigningKey, amount: u64, nonce: u64) -> Transaction {
+        let pubkey = sender_key.verifying_key().to_bytes();
+        let payload = TxPayload::Stake { amount };
+
+        let mut tx = Transaction {
+            sender_pubkey: pubkey,
+            nonce,
+            payload,
+            signature: [0u8; 64],
+        };
+
+        let msg = tx.signing_bytes();
+        tx.signature = sign(sender_key, &msg);
+        tx
+    }
+
+    /// Helper: build a signed Unstake transaction.
+    fn make_unstake_tx(sender_key: &SigningKey, amount: u64, nonce: u64) -> Transaction {
+        let pubkey = sender_key.verifying_key().to_bytes();
+        let payload = TxPayload::Unstake { amount };
+
+        let mut tx = Transaction {
+            sender_pubkey: pubkey,
+            nonce,
+            payload,
+            signature: [0u8; 64],
+        };
+
+        let msg = tx.signing_bytes();
+        tx.signature = sign(sender_key, &msg);
+        tx
+    }
+
+    #[test]
+    fn stake_via_executor() {
+        let (store, _dir) = open_tmp();
+
+        let sender_key = generate_signing_key();
+        let sender_addr = Address::from_public_key(&sender_key.verifying_key());
+
+        // Fund with 200_000 SOLID (in smallest units: 200_000 * ONE_SOLID).
+        // MIN_STAKE = 100_000_000_000 = 1000 SOLID.
+        // We use MIN_STAKE directly as the stake amount, and fund with 2 * MIN_STAKE.
+        use solidus_txns::staking::MIN_STAKE;
+        use solidus_txns::types::FEE_STAKE;
+        let initial_balance = MIN_STAKE * 2 + FEE_STAKE;
+        fund_account(&store, sender_addr, initial_balance);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        let tx = make_stake_tx(&sender_key, MIN_STAKE, 0);
+        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[])
+            .expect("execute_block failed");
+
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].status,
+            TxStatus::Success,
+            "Stake should succeed; got: {:?}",
+            receipts[0].status
+        );
+        assert_eq!(receipts[0].fee_paid, FEE_STAKE);
+        assert_eq!(receipts[0].events.len(), 1);
+
+        // Verify Staked event.
+        match &receipts[0].events[0] {
+            Event::Staked { validator, amount, total_stake } => {
+                assert_eq!(*validator, sender_addr);
+                assert_eq!(*amount, MIN_STAKE);
+                assert_eq!(*total_stake, MIN_STAKE);
+            }
+            other => panic!("expected Staked event, got: {:?}", other),
+        }
+
+        // Verify ValidatorInfo stored and active.
+        let validator_info = load_validator(&store, &sender_addr)
+            .expect("load_validator failed")
+            .expect("validator should be stored");
+        assert!(validator_info.active, "validator should be active");
+        assert_eq!(validator_info.staked, MIN_STAKE);
+
+        // Verify balance was reduced by (fee + staked_amount).
+        let sender = load_account(&store, &sender_addr).expect("load sender failed");
+        assert_eq!(
+            sender.balance,
+            initial_balance - FEE_STAKE - MIN_STAKE,
+            "sender balance should be reduced by fee + staked amount"
+        );
+    }
+
+    #[test]
+    fn unstake_via_executor() {
+        let (store, _dir) = open_tmp();
+
+        let sender_key = generate_signing_key();
+        let sender_addr = Address::from_public_key(&sender_key.verifying_key());
+
+        use solidus_txns::staking::MIN_STAKE;
+        use solidus_txns::types::FEE_STAKE;
+        use solidus_txns::types::FEE_UNSTAKE;
+
+        // Fund with enough for fee (stake) + stake amount + fee (unstake).
+        let initial_balance = MIN_STAKE * 2 + FEE_STAKE + FEE_UNSTAKE;
+        fund_account(&store, sender_addr, initial_balance);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        // Step 1: Stake.
+        let tx_stake = make_stake_tx(&sender_key, MIN_STAKE, 0);
+        let receipts = execute_block(&store, &[tx_stake], 1, &treasury_addr, &[])
+            .expect("execute_block (stake) failed");
+        assert_eq!(
+            receipts[0].status,
+            TxStatus::Success,
+            "Stake should succeed; got: {:?}",
+            receipts[0].status
+        );
+
+        // Verify staked state.
+        let info = load_validator(&store, &sender_addr)
+            .expect("load_validator failed")
+            .expect("should exist after stake");
+        assert!(info.active);
+        assert_eq!(info.staked, MIN_STAKE);
+
+        // Step 2: Fully unstake (nonce=1).
+        let tx_unstake = make_unstake_tx(&sender_key, MIN_STAKE, 1);
+        let receipts = execute_block(&store, &[tx_unstake], 2, &treasury_addr, &[])
+            .expect("execute_block (unstake) failed");
+
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].status,
+            TxStatus::Success,
+            "Unstake should succeed; got: {:?}",
+            receipts[0].status
+        );
+        assert_eq!(receipts[0].events.len(), 1);
+
+        // Verify Unstaked event.
+        match &receipts[0].events[0] {
+            Event::Unstaked { validator, amount, remaining_stake } => {
+                assert_eq!(*validator, sender_addr);
+                assert_eq!(*amount, MIN_STAKE);
+                assert_eq!(*remaining_stake, 0);
+            }
+            other => panic!("expected Unstaked event, got: {:?}", other),
+        }
+
+        // Verify ValidatorInfo: staked=0, active=false.
+        let info = load_validator(&store, &sender_addr)
+            .expect("load_validator failed")
+            .expect("should still exist after unstake");
+        assert_eq!(info.staked, 0, "staked should be zero after full unstake");
+        assert!(!info.active, "validator should be inactive after full unstake");
     }
 }

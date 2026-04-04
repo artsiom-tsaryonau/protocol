@@ -98,16 +98,20 @@ impl Proposer {
 
         let header = BlockHeader {
             height: new_height,
+            round: 0,
             parent_hash: self.last_block_hash,
             state_root: [0u8; 32], // TODO: compute from Merkle tree roots
             transactions_root,
             timestamp_ms,
             tx_count: txs.len() as u32,
+            proposer: self.config.treasury_address,
         };
 
         let block = Block {
             header,
             transactions: txs,
+            parent_qc: None,
+            vrf_proof: None,
         };
 
         let block_hash = block.hash();

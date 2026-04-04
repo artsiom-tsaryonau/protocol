@@ -4,6 +4,9 @@ use solidus_crypto::ed25519;
 use solidus_crypto::hash::blake3_hash;
 use solidus_crypto::keys::Address;
 
+use crate::credential::CredentialType;
+use crate::did::{DidPatch, Service};
+
 // ---------------------------------------------------------------------------
 // Serde helpers for large byte arrays ([u8; 64]) that serde doesn't cover
 // ---------------------------------------------------------------------------
@@ -55,12 +58,48 @@ pub const ONE_SOLID: u64 = 100_000_000;
 // TxPayload
 // ---------------------------------------------------------------------------
 
-/// The inner payload of a transaction. Only `Transfer` is implemented for now;
-/// additional variants (DID operations, staking, etc.) will be added later.
+/// The inner payload of a transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TxPayload {
     /// Transfer `amount` (in smallest units) to `to`.
     Transfer { to: Address, amount: u64 },
+    /// Register a new DID document for the sender.
+    DidCreate {
+        /// Raw 32-byte Ed25519 public key embedded in the DID document.
+        public_key: [u8; 32],
+        /// Initial service endpoints to include in the document.
+        service_endpoints: Vec<Service>,
+    },
+    /// Apply a set of patches to an existing DID document.
+    DidUpdate {
+        /// The DID string to update.
+        did: String,
+        /// Ordered list of patches to apply atomically.
+        patches: Vec<DidPatch>,
+    },
+    /// Permanently deactivate a DID document.
+    DidDeactivate {
+        /// The DID string to deactivate.
+        did: String,
+    },
+    /// Issue a new verifiable credential from the sender (issuer) to a subject DID.
+    CredentialIssue {
+        /// DID of the credential subject.
+        subject_did: String,
+        /// The type of credential being issued.
+        credential_type: CredentialType,
+        /// BLAKE3 hash of the off-chain credential payload.
+        hash: [u8; 32],
+    },
+    /// Revoke a previously issued credential. Only the original issuer may do this.
+    CredentialRevoke {
+        /// The unique credential identifier to revoke.
+        credential_id: String,
+    },
+    /// Stake `amount` (in smallest units) to become or remain an active validator.
+    Stake { amount: u64 },
+    /// Begin unbonding `amount` from the sender's staked balance.
+    Unstake { amount: u64 },
 }
 
 impl TxPayload {
@@ -68,6 +107,13 @@ impl TxPayload {
     pub fn fee(&self) -> u64 {
         match self {
             TxPayload::Transfer { .. } => FEE_TRANSFER,
+            TxPayload::DidCreate { .. } => FEE_DID_CREATE,
+            TxPayload::DidUpdate { .. } => FEE_DID_UPDATE,
+            TxPayload::DidDeactivate { .. } => FEE_DID_DEACTIVATE,
+            TxPayload::CredentialIssue { credential_type, .. } => credential_type.issue_fee(),
+            TxPayload::CredentialRevoke { .. } => FEE_CREDENTIAL_REVOKE,
+            TxPayload::Stake { .. } => FEE_STAKE,
+            TxPayload::Unstake { .. } => FEE_UNSTAKE,
         }
     }
 }
@@ -154,6 +200,35 @@ pub enum Event {
         from: Address,
         to: Address,
         amount: u64,
+    },
+    /// A new DID document was registered.
+    DidCreated {
+        did: String,
+        controller: Address,
+    },
+    /// An existing DID document was updated.
+    DidUpdated { did: String },
+    /// A DID document was permanently deactivated.
+    DidDeactivated { did: String },
+    /// A new verifiable credential was issued.
+    CredentialIssued {
+        credential_id: String,
+        issuer: String,
+        subject: String,
+    },
+    /// A credential was revoked by its issuer.
+    CredentialRevoked { credential_id: String },
+    /// A validator staked tokens.
+    Staked {
+        validator: Address,
+        amount: u64,
+        total_stake: u64,
+    },
+    /// A validator began unbonding tokens.
+    Unstaked {
+        validator: Address,
+        amount: u64,
+        remaining_stake: u64,
     },
 }
 

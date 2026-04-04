@@ -16,9 +16,30 @@ pub const CF_HEADERS: &str = "headers";
 pub const CF_RECEIPTS: &str = "receipts";
 /// Column family for Merkle tree nodes (hash -> node bytes).
 pub const CF_MERKLE: &str = "merkle";
+/// Column family for DID documents (did_string -> DidDocument bytes).
+pub const CF_DIDS: &str = "dids";
+/// Column family for credential records (credential_id -> CredentialRecord bytes).
+pub const CF_CREDENTIALS: &str = "credentials";
+/// Column family for credential index by subject DID (subject_did -> [credential_id]).
+pub const CF_CRED_BY_SUBJECT: &str = "cred_by_subject";
+/// Column family for credential index by issuer DID (issuer_did -> [credential_id]).
+pub const CF_CRED_BY_ISSUER: &str = "cred_by_issuer";
+/// Column family for validator records (address_bytes -> ValidatorInfo).
+pub const CF_VALIDATORS: &str = "validators";
 
 /// All column families used by the store.
-pub const COLUMN_FAMILIES: &[&str] = &[CF_ACCOUNTS, CF_BLOCKS, CF_HEADERS, CF_RECEIPTS, CF_MERKLE];
+pub const COLUMN_FAMILIES: &[&str] = &[
+    CF_ACCOUNTS,
+    CF_BLOCKS,
+    CF_HEADERS,
+    CF_RECEIPTS,
+    CF_MERKLE,
+    CF_DIDS,
+    CF_CREDENTIALS,
+    CF_CRED_BY_SUBJECT,
+    CF_CRED_BY_ISSUER,
+    CF_VALIDATORS,
+];
 
 // ---------------------------------------------------------------------------
 // StoreError

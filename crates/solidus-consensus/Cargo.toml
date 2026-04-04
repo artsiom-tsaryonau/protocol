@@ -12,6 +12,9 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+async-trait.workspace = true
+bitvec.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
