@@ -43,6 +43,8 @@ pub struct Proposer {
     config: ProposerConfig,
     current_height: u64,
     last_block_hash: [u8; 32],
+    /// Shared latest height — updated after each block so RPC can serve it.
+    latest_height: Option<Arc<Mutex<u64>>>,
 }
 
 impl Proposer {
@@ -60,7 +62,13 @@ impl Proposer {
             config,
             current_height: genesis_height,
             last_block_hash: genesis_hash,
+            latest_height: None,
         }
+    }
+
+    /// Set the shared latest_height so RPC getLatestBlock works.
+    pub fn set_latest_height(&mut self, height: Arc<Mutex<u64>>) {
+        self.latest_height = Some(height);
     }
 
     /// Attempt to propose and commit a new block.
@@ -74,9 +82,11 @@ impl Proposer {
             pool.take(self.config.max_block_txs)
         };
 
-        if txs.is_empty() {
-            return Ok(None);
-        }
+        // Produce blocks even when mempool is empty to maintain chain liveness.
+        // Empty blocks keep the block height advancing, which is needed for:
+        // - Explorer indexer to show activity
+        // - SDK time-based operations
+        // - Consistent block intervals
 
         let new_height = self.current_height + 1;
 
@@ -129,6 +139,13 @@ impl Proposer {
         self.current_height = new_height;
         self.last_block_hash = block_hash;
 
+        // Update shared latest_height for RPC.
+        if let Some(ref lh) = self.latest_height {
+            if let Ok(mut h) = lh.lock() {
+                *h = new_height;
+            }
+        }
+
         info!(
             height = new_height,
             tx_count = block.header.tx_count,
@@ -148,14 +165,17 @@ impl Proposer {
                 _ = tokio::time::sleep(interval) => {
                     match self.propose_block() {
                         Ok(Some((block, _receipts))) => {
-                            info!(
-                                height = block.header.height,
-                                tx_count = block.header.tx_count,
-                                "produced block"
-                            );
+                            if block.header.tx_count > 0 {
+                                info!(
+                                    height = block.header.height,
+                                    tx_count = block.header.tx_count,
+                                    "produced block"
+                                );
+                            }
+                            // Silently produce empty blocks (don't spam logs).
                         }
                         Ok(None) => {
-                            // No transactions — skip this round.
+                            // Should not happen anymore (we always produce blocks).
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to propose block");

@@ -51,8 +51,13 @@ pub trait ConsensusTransport: Send + Sync + 'static {
     /// Broadcast `msg` to all connected peers except ourselves.
     async fn broadcast(&self, msg: ConsensusMessage) -> Result<(), TransportError>;
 
-    /// Receive the next incoming message.
+    /// Receive the next incoming message (blocks until one is available).
     ///
     /// Returns `(sender_peer_id, message)`.
     async fn recv(&mut self) -> Result<(PeerId, ConsensusMessage), TransportError>;
+
+    /// Non-blocking receive — returns immediately with `None` if no message is
+    /// queued.  Used by the consensus loop to drain buffered messages before
+    /// re-entering the pacemaker timeout.
+    fn try_recv(&mut self) -> Option<(PeerId, ConsensusMessage)>;
 }

@@ -86,6 +86,10 @@ impl ConsensusTransport for ChannelTransport {
     async fn recv(&mut self) -> Result<(PeerId, ConsensusMessage), TransportError> {
         self.receiver.recv().await.ok_or(TransportError::Closed)
     }
+
+    fn try_recv(&mut self) -> Option<(PeerId, ConsensusMessage)> {
+        self.receiver.try_recv().ok()
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use solidus_consensus::hotstuff::{HotStuffConfig, HotStuffEngine};
@@ -206,6 +207,7 @@ async fn run_node(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         0,
         genesis_hash,
     );
+    proposer.set_latest_height(Arc::clone(&latest_height));
 
     let proposer_handle = tokio::spawn(async move {
         proposer.run(shutdown_rx).await;
@@ -558,12 +560,22 @@ async fn run_dev_testnet(testnet_dir: &str, rpc_port: u16) -> Result<(), Box<dyn
 ///
 /// Drives the pacemaker, handles incoming proposals/votes/timeouts, and
 /// manages block commitment via the 3-chain finality rule.
+///
+/// After receiving a message, the loop drains all buffered messages via
+/// `try_recv()` before re-entering the pacemaker timeout.  This prevents
+/// timeout floods: when many timeout votes arrive simultaneously (e.g. all
+/// validators timing out in the same round), they are processed in a single
+/// batch rather than interleaved with spurious timeout re-fires.
 async fn run_consensus_loop(
     engine: &mut HotStuffEngine,
     transport: &mut impl ConsensusTransport,
     latest_height: Arc<Mutex<u64>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Mark the initial value as seen so that `changed()` doesn't fire
+    // immediately — we only want to break on an actual shutdown signal.
+    let _ = shutdown.borrow_and_update();
+
     // Initial proposal attempt — the first leader should propose immediately
     try_propose_if_leader(engine, transport).await;
 
@@ -579,6 +591,16 @@ async fn run_consensus_loop(
 
             // ── Pacemaker timeout: broadcast timeout vote ────────────────
             _ = tokio::time::sleep_until(deadline) => {
+                // Before broadcasting a new timeout, drain any messages that
+                // arrived while we were waiting — they may advance the round
+                // and make this timeout unnecessary.
+                drain_pending(engine, transport, &latest_height).await;
+
+                // Re-check: if draining advanced us past this round, skip.
+                if engine.pacemaker.deadline() > Instant::now() {
+                    continue;
+                }
+
                 let round = engine.pacemaker.current_round();
                 info!(round = round, "pacemaker timeout — broadcasting timeout vote");
 
@@ -600,14 +622,51 @@ async fn run_consensus_loop(
                 match result {
                     Ok((from, msg)) => {
                         handle_consensus_message(engine, transport, &latest_height, from, msg).await;
+                        // Drain all buffered messages before returning to the
+                        // select! — this ensures the pacemaker deadline is
+                        // recomputed with up-to-date round state.
+                        drain_pending(engine, transport, &latest_height).await;
                     }
                     Err(e) => {
                         warn!(error = %e, "transport recv error");
-                        // If the transport is closed, break out of the loop.
                         break;
                     }
                 }
             }
+        }
+    }
+}
+
+/// Drain all buffered messages from the transport without blocking.
+///
+/// Processes up to 256 messages per call to bound CPU time per drain cycle.
+/// Stale timeout votes (for rounds older than the engine's current round)
+/// are silently dropped.
+async fn drain_pending(
+    engine: &mut HotStuffEngine,
+    transport: &mut impl ConsensusTransport,
+    latest_height: &Arc<Mutex<u64>>,
+) {
+    const MAX_DRAIN: usize = 256;
+    let mut drained = 0;
+    while let Some((from, msg)) = transport.try_recv() {
+        // Drop stale timeout votes — they cannot form a TC for the current
+        // round and would only waste processing time.
+        if let ConsensusMessage::TimeoutVoteMsg(ref tv) = msg {
+            if tv.round < engine.pacemaker.current_round() {
+                continue;
+            }
+        }
+        // Drop stale votes for rounds we've already moved past.
+        if let ConsensusMessage::VoteMsg(ref v) = msg {
+            if v.round < engine.pacemaker.current_round() {
+                continue;
+            }
+        }
+        handle_consensus_message(engine, transport, latest_height, from, msg).await;
+        drained += 1;
+        if drained >= MAX_DRAIN {
+            break;
         }
     }
 }
@@ -658,6 +717,11 @@ async fn handle_consensus_message(
         }
 
         ConsensusMessage::VoteMsg(vote) => {
+            // Drop votes for rounds we've already moved past.
+            if vote.round < engine.pacemaker.current_round() {
+                return;
+            }
+
             info!(
                 round = vote.round,
                 voter = vote.voter_index,
@@ -665,30 +729,37 @@ async fn handle_consensus_message(
             );
 
             if let Some(qc) = engine.process_vote(vote) {
-                engine.on_new_qc(&qc);
+                apply_qc(engine, transport, latest_height, &qc).await;
 
-                // Attempt 3-chain commit.
-                let committed = engine.try_commit();
-                for (block, _) in &committed {
-                    if let Ok(mut h) = latest_height.lock() {
-                        *h = block.header.height;
-                    }
-                    info!(
-                        height = block.header.height,
-                        round = block.header.round,
-                        "block committed"
-                    );
+                // Broadcast the QC so all nodes advance and the next leader
+                // can propose — this is the critical relay step.
+                if let Err(e) = transport.broadcast(ConsensusMessage::NewQC(qc)).await {
+                    warn!(error = %e, "failed to broadcast QC");
                 }
-
-                // Advance round on QC.
-                engine.pacemaker.advance_round_on_qc(qc.round + 1);
-
-                // If this node is the next leader, propose a block
-                try_propose_if_leader(engine, transport).await;
             }
         }
 
+        ConsensusMessage::NewQC(qc) => {
+            // Only process if this QC is for a round we haven't passed yet.
+            if qc.round < engine.pacemaker.current_round() {
+                return;
+            }
+
+            info!(
+                round = qc.round,
+                signer_count = qc.signer_count(),
+                "received QC relay"
+            );
+
+            apply_qc(engine, transport, latest_height, &qc).await;
+        }
+
         ConsensusMessage::TimeoutVoteMsg(tv) => {
+            // Drop timeout votes for rounds we've already moved past.
+            if tv.round < engine.pacemaker.current_round() {
+                return;
+            }
+
             info!(
                 round = tv.round,
                 voter = tv.voter_index,
@@ -709,6 +780,36 @@ async fn handle_consensus_message(
         // the consensus loop directly (would be routed to mempool / sync).
         _ => {}
     }
+}
+
+/// Apply a QC: update engine state, attempt 3-chain commit, advance round,
+/// and propose if this node is the next leader.
+async fn apply_qc(
+    engine: &mut HotStuffEngine,
+    transport: &mut impl ConsensusTransport,
+    latest_height: &Arc<Mutex<u64>>,
+    qc: &solidus_consensus::types::QuorumCertificate,
+) {
+    engine.on_new_qc(qc);
+
+    // Attempt 3-chain commit.
+    let committed = engine.try_commit();
+    for (block, _) in &committed {
+        if let Ok(mut h) = latest_height.lock() {
+            *h = block.header.height;
+        }
+        info!(
+            height = block.header.height,
+            round = block.header.round,
+            "block committed"
+        );
+    }
+
+    // Advance round on QC.
+    engine.pacemaker.advance_round_on_qc(qc.round + 1);
+
+    // If this node is the next leader, propose a block
+    try_propose_if_leader(engine, transport).await;
 }
 
 /// Check if this node is the leader for the current round and propose a block if so.

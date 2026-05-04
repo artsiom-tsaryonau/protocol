@@ -347,7 +347,8 @@ impl ConsensusTransport for LibP2PTransport {
             // Targeted consensus messages: send individually to all peers.
             ConsensusMessage::Proposal { .. }
             | ConsensusMessage::VoteMsg(_)
-            | ConsensusMessage::TimeoutVoteMsg(_) => {
+            | ConsensusMessage::TimeoutVoteMsg(_)
+            | ConsensusMessage::NewQC(_) => {
                 for (&_idx, &peer_id) in &self.peer_map {
                     self.cmd_tx
                         .send(SwarmCmd::Send {
@@ -364,6 +365,10 @@ impl ConsensusTransport for LibP2PTransport {
 
     async fn recv(&mut self) -> Result<(PeerId, ConsensusMessage), TransportError> {
         self.msg_rx.recv().await.ok_or(TransportError::Closed)
+    }
+
+    fn try_recv(&mut self) -> Option<(PeerId, ConsensusMessage)> {
+        self.msg_rx.try_recv().ok()
     }
 }
 
