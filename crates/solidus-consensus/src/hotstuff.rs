@@ -17,6 +17,7 @@ use solidus_crypto::bls::{BlsSecretKey, BlsSignature};
 use solidus_crypto::hash::blake3_hash;
 use solidus_crypto::keys::Address;
 use solidus_crypto::vrf::VrfOutput;
+use solidus_state::executor::compute_state_root;
 use solidus_state::store::{Store, CF_BLOCKS, CF_RECEIPTS};
 use solidus_txns::types::Receipt;
 
@@ -175,11 +176,17 @@ impl HotStuffEngine {
             .expect("system clock before UNIX epoch")
             .as_millis() as u64;
 
+        // State root from current (pre-execution) store state.
+        // TODO: for full correctness, proposer should execute speculatively
+        // and include the post-execution state root. This requires separating
+        // proposer vs. validator execution paths in the consensus loop.
+        let state_root = compute_state_root(&self.store).unwrap_or([0u8; 32]);
+
         let header = BlockHeader {
             height,
             round,
             parent_hash,
-            state_root: [0u8; 32], // TODO: compute from Merkle tree roots
+            state_root,
             transactions_root,
             timestamp_ms,
             tx_count: txs.len() as u32,

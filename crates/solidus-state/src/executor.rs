@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use solidus_crypto::keys::Address;
 use solidus_txns::credential::{CredentialRecord, execute_credential_issue, execute_credential_revoke};
 use solidus_txns::did::{DidDocument, execute_did_create, execute_did_update, execute_did_deactivate};
@@ -7,6 +9,7 @@ use solidus_txns::types::{Event, Receipt, Transaction, TxPayload, TxStatus};
 
 use crate::account::Account;
 use crate::store::{Store, StoreError, CF_ACCOUNTS, CF_CREDENTIALS, CF_CRED_BY_ISSUER, CF_CRED_BY_SUBJECT, CF_DIDS, CF_RECEIPTS, CF_VALIDATORS};
+use crate::tree::{SparseMerkleTree, TreeId, global_state_root};
 
 // ---------------------------------------------------------------------------
 // Fee distribution constants
@@ -681,6 +684,44 @@ fn distribute_fees(
 
     // The remaining percentage is burned — no credit needed.
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// State root computation
+// ---------------------------------------------------------------------------
+
+/// Compute the global state root from the current store contents.
+///
+/// Builds four Sparse Merkle Trees (accounts, DIDs, credentials, validators)
+/// by scanning the corresponding column families, then combines the four
+/// tree roots into a single global root via BLAKE3.
+pub fn compute_state_root(store: &Arc<Store>) -> Result<[u8; 32], ExecutorError> {
+    let mut accounts_tree = SparseMerkleTree::new(Arc::clone(store), TreeId::Accounts);
+    for (k, v) in store.iter_cf(CF_ACCOUNTS)? {
+        accounts_tree.insert(&k, &v)?;
+    }
+
+    let mut dids_tree = SparseMerkleTree::new(Arc::clone(store), TreeId::Dids);
+    for (k, v) in store.iter_cf(CF_DIDS)? {
+        dids_tree.insert(&k, &v)?;
+    }
+
+    let mut credentials_tree = SparseMerkleTree::new(Arc::clone(store), TreeId::Credentials);
+    for (k, v) in store.iter_cf(CF_CREDENTIALS)? {
+        credentials_tree.insert(&k, &v)?;
+    }
+
+    let mut validators_tree = SparseMerkleTree::new(Arc::clone(store), TreeId::Validators);
+    for (k, v) in store.iter_cf(CF_VALIDATORS)? {
+        validators_tree.insert(&k, &v)?;
+    }
+
+    Ok(global_state_root(
+        &accounts_tree.root(),
+        &dids_tree.root(),
+        &credentials_tree.root(),
+        &validators_tree.root(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,5 +1489,58 @@ mod tests {
             .expect("should still exist after unstake");
         assert_eq!(info.staked, 0, "staked should be zero after full unstake");
         assert!(!info.active, "validator should be inactive after full unstake");
+    }
+
+    // -----------------------------------------------------------------------
+    // State root tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn state_root_empty_store() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let store = Arc::new(Store::open(dir.path()).expect("failed to open store"));
+        let root = compute_state_root(&store).expect("compute_state_root failed");
+        // Empty store produces the global root of 4 empty SMTs.
+        assert_ne!(root, [0u8; 32]);
+    }
+
+    #[test]
+    fn state_root_changes_after_execution() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let store = Arc::new(Store::open(dir.path()).expect("failed to open store"));
+
+        let root_before = compute_state_root(&store).expect("compute_state_root failed");
+
+        let sender_key = generate_signing_key();
+        let receiver_key = generate_signing_key();
+        let sender_addr = Address::from_public_key(&sender_key.verifying_key());
+        let receiver_addr = Address::from_public_key(&receiver_key.verifying_key());
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        fund_account(&store, sender_addr, 1_000_000);
+
+        let tx = make_transfer_tx(&sender_key, receiver_addr, 500, 0);
+        execute_block(&store, &[tx], 1, &treasury_addr, &[])
+            .expect("execute_block failed");
+
+        let root_after = compute_state_root(&store).expect("compute_state_root failed");
+        assert_ne!(root_before, root_after);
+    }
+
+    #[test]
+    fn state_root_deterministic() {
+        // Two stores with identical state produce the same root.
+        let dir1 = tempdir().expect("failed to create temp dir");
+        let store1 = Arc::new(Store::open(dir1.path()).expect("failed to open store"));
+        let dir2 = tempdir().expect("failed to create temp dir");
+        let store2 = Arc::new(Store::open(dir2.path()).expect("failed to open store"));
+
+        let addr = Address::from_bytes([0x11u8; 20]);
+        fund_account(&store1, addr, 999);
+        fund_account(&store2, addr, 999);
+
+        let root1 = compute_state_root(&store1).expect("compute_state_root failed");
+        let root2 = compute_state_root(&store2).expect("compute_state_root failed");
+        assert_eq!(root1, root2);
     }
 }

@@ -134,6 +134,21 @@ impl Store {
         Ok(())
     }
 
+    /// Iterate over all key-value pairs in a column family.
+    pub fn iter_cf(&self, cf_name: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StoreError::CfNotFound(cf_name.to_string()))?;
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut pairs = Vec::new();
+        for item in iter {
+            let (k, v) = item?;
+            pairs.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(pairs)
+    }
+
     /// Expose the underlying `rocksdb::DB` for advanced use (e.g. obtaining CF
     /// handles when building a `StoreBatch`).
     pub fn inner(&self) -> &DB {

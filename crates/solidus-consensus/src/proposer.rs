@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use solidus_crypto::keys::Address;
-use solidus_state::executor::execute_block;
+use solidus_state::executor::{execute_block, compute_state_root};
 use solidus_state::store::{Store, CF_BLOCKS, CF_HEADERS};
 use solidus_txns::types::Receipt;
 use tokio::sync::watch;
@@ -99,6 +99,9 @@ impl Proposer {
             &self.config.validator_addresses,
         )?;
 
+        // Compute state root after execution.
+        let state_root = compute_state_root(&self.store)?;
+
         // Build the block header.
         let transactions_root = compute_transactions_root(&txs);
         let timestamp_ms = SystemTime::now()
@@ -110,7 +113,7 @@ impl Proposer {
             height: new_height,
             round: 0,
             parent_hash: self.last_block_hash,
-            state_root: [0u8; 32], // TODO: compute from Merkle tree roots
+            state_root,
             transactions_root,
             timestamp_ms,
             tx_count: txs.len() as u32,
