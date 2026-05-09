@@ -13,7 +13,10 @@ use solidus_state::store::{Store, CF_BLOCKS, CF_CRED_BY_ISSUER, CF_CRED_BY_SUBJE
 use solidus_txns::staking::ValidatorInfo;
 use solidus_txns::types::{Receipt, Transaction};
 
-use crate::types::{RpcBlock, RpcCredentialRecord, RpcCredentialVerifyResult, RpcDidDocument, RpcReceipt, RpcValidatorInfo};
+use crate::types::{
+    RpcBlock, RpcCredentialProofResult, RpcCredentialRecord, RpcCredentialVerifyResult,
+    RpcDidDocument, RpcDisclosedMessage, RpcReceipt, RpcValidatorInfo,
+};
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -92,6 +95,37 @@ pub trait SolidusApi {
     /// Return validator info for a given base58 address, or `null` if not found.
     #[method(name = "solidus_getValidatorStake")]
     fn get_validator_stake(&self, address: String) -> RpcResult<Option<RpcValidatorInfo>>;
+
+    /// Verify a BBS+ selective-disclosure proof statelessly.
+    ///
+    /// All hex inputs must be lowercase. `disclosed_messages` indices are
+    /// the positions in the originally signed vector; `total_message_count`
+    /// is the full vector length the issuer signed. Returns `true` iff the
+    /// proof is cryptographically valid.
+    #[method(name = "solidus_bbsVerifyProof")]
+    fn bbs_verify_proof(
+        &self,
+        proof_hex: String,
+        pubkey_hex: String,
+        header_hex: String,
+        ph_hex: String,
+        disclosed_messages: Vec<RpcDisclosedMessage>,
+        total_message_count: u32,
+    ) -> RpcResult<bool>;
+
+    /// Verify a BBS+ proof against an on-chain credential record. Looks up
+    /// the credential by ID, pulls `bbs_pubkey` and `bbs_message_count` from
+    /// chain state, then runs proof verification. Returns combined validity
+    /// (proof + revocation status).
+    #[method(name = "solidus_bbsVerifyCredentialProof")]
+    fn bbs_verify_credential_proof(
+        &self,
+        credential_id: String,
+        proof_hex: String,
+        header_hex: String,
+        ph_hex: String,
+        disclosed_messages: Vec<RpcDisclosedMessage>,
+    ) -> RpcResult<RpcCredentialProofResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +423,137 @@ impl SolidusApiServer for SolidusRpcImpl {
             }
         }
         Ok(validators)
+    }
+
+    fn bbs_verify_proof(
+        &self,
+        proof_hex: String,
+        pubkey_hex: String,
+        header_hex: String,
+        ph_hex: String,
+        disclosed_messages: Vec<RpcDisclosedMessage>,
+        total_message_count: u32,
+    ) -> RpcResult<bool> {
+        let pk = solidus_crypto::bbs::BbsPublicKey::from_hex(&pubkey_hex)
+            .map_err(|e| invalid_params(format!("invalid pubkey hex: {e}")))?;
+        let proof = solidus_crypto::bbs::BbsProof::from_hex(&proof_hex)
+            .map_err(|e| invalid_params(format!("invalid proof hex: {e}")))?;
+        let header = hex::decode(&header_hex)
+            .map_err(|e| invalid_params(format!("invalid header hex: {e}")))?;
+        let ph = hex::decode(&ph_hex)
+            .map_err(|e| invalid_params(format!("invalid ph hex: {e}")))?;
+
+        let mut sorted = disclosed_messages.clone();
+        sorted.sort_by_key(|m| m.index);
+        for w in sorted.windows(2) {
+            if w[0].index == w[1].index {
+                return Err(invalid_params("duplicate disclosed index"));
+            }
+        }
+        if let Some(last) = sorted.last() {
+            if last.index >= total_message_count {
+                return Err(invalid_params(format!(
+                    "disclosed index {} >= total_message_count {}",
+                    last.index, total_message_count
+                )));
+            }
+        }
+
+        let mut indices: Vec<usize> = Vec::with_capacity(sorted.len());
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(sorted.len());
+        for dm in &sorted {
+            indices.push(dm.index as usize);
+            messages.push(
+                hex::decode(&dm.message)
+                    .map_err(|e| invalid_params(format!("invalid message hex: {e}")))?,
+            );
+        }
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|v| v.as_slice()).collect();
+
+        Ok(proof.is_valid(&pk, &header, &ph, &indices, &msg_refs))
+    }
+
+    fn bbs_verify_credential_proof(
+        &self,
+        credential_id: String,
+        proof_hex: String,
+        header_hex: String,
+        ph_hex: String,
+        disclosed_messages: Vec<RpcDisclosedMessage>,
+    ) -> RpcResult<RpcCredentialProofResult> {
+        let cred = match load_credential(&self.store, &credential_id) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Ok(RpcCredentialProofResult {
+                    valid: false,
+                    proof_valid: false,
+                    is_bbs: false,
+                    revoked: false,
+                    credential: None,
+                });
+            }
+            Err(e) => return Err(internal_error(format!("store error: {e}"))),
+        };
+
+        let bbs_pubkey_bytes = match cred.bbs_pubkey {
+            Some(pk) => pk,
+            None => {
+                return Ok(RpcCredentialProofResult {
+                    valid: false,
+                    proof_valid: false,
+                    is_bbs: false,
+                    revoked: cred.revoked,
+                    credential: Some(RpcCredentialRecord::from_credential(&cred)),
+                });
+            }
+        };
+        let total_message_count = cred.bbs_message_count.unwrap_or(0);
+
+        let pk = solidus_crypto::bbs::BbsPublicKey::from_bytes(&bbs_pubkey_bytes)
+            .map_err(|e| internal_error(format!("on-chain bbs_pubkey is malformed: {e}")))?;
+        let proof = solidus_crypto::bbs::BbsProof::from_hex(&proof_hex)
+            .map_err(|e| invalid_params(format!("invalid proof hex: {e}")))?;
+        let header = hex::decode(&header_hex)
+            .map_err(|e| invalid_params(format!("invalid header hex: {e}")))?;
+        let ph = hex::decode(&ph_hex)
+            .map_err(|e| invalid_params(format!("invalid ph hex: {e}")))?;
+
+        let mut sorted = disclosed_messages.clone();
+        sorted.sort_by_key(|m| m.index);
+        for w in sorted.windows(2) {
+            if w[0].index == w[1].index {
+                return Err(invalid_params("duplicate disclosed index"));
+            }
+        }
+        if let Some(last) = sorted.last() {
+            if last.index >= total_message_count {
+                return Err(invalid_params(format!(
+                    "disclosed index {} >= on-chain total_message_count {}",
+                    last.index, total_message_count
+                )));
+            }
+        }
+
+        let mut indices: Vec<usize> = Vec::with_capacity(sorted.len());
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(sorted.len());
+        for dm in &sorted {
+            indices.push(dm.index as usize);
+            messages.push(
+                hex::decode(&dm.message)
+                    .map_err(|e| invalid_params(format!("invalid message hex: {e}")))?,
+            );
+        }
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|v| v.as_slice()).collect();
+
+        let proof_valid = proof.is_valid(&pk, &header, &ph, &indices, &msg_refs);
+
+        Ok(RpcCredentialProofResult {
+            valid: proof_valid && !cred.revoked,
+            proof_valid,
+            is_bbs: true,
+            revoked: cred.revoked,
+            credential: Some(RpcCredentialRecord::from_credential(&cred)),
+        })
     }
 }
 
@@ -717,6 +882,8 @@ mod tests {
             issued_ms: 1_700_000_000_000,
             revoked: false,
             revoked_ms: None,
+            bbs_pubkey: None,
+            bbs_message_count: None,
         };
         store
             .put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes())
@@ -795,5 +962,313 @@ mod tests {
         assert_eq!(rpc_info.reputation, 1000);
         assert_eq!(rpc_info.unbonding, 0);
         assert_eq!(rpc_info.address, addr.to_base58());
+    }
+
+    // -----------------------------------------------------------------------
+    // BBS+ RPC tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a sample 8-message KYC vector + sign with a fresh BBS keypair.
+    /// Returns (sk, pk_bytes, sig, messages, header).
+    fn make_bbs_credential_fixtures() -> (
+        solidus_crypto::bbs::BbsSecretKey,
+        [u8; 96],
+        solidus_crypto::bbs::BbsSignature,
+        Vec<&'static [u8]>,
+        &'static [u8],
+    ) {
+        use solidus_crypto::bbs::BbsSecretKey;
+        let sk = BbsSecretKey::from_ikm(b"rpc-bbs-test-ikm-must-be-at-least-32-bytes-long").expect("ikm");
+        let pk_bytes = sk.public_key().to_bytes();
+        let messages: Vec<&[u8]> = vec![
+            b"did:solidus:testnet:alice".as_ref(),
+            b"Alice Liddell".as_ref(),
+            b"1990-07-04".as_ref(),
+            b"GB".as_ref(),
+            b"passport".as_ref(),
+            b"P-12345".as_ref(),
+            b"KycL2".as_ref(),
+            b"2026-01-15T00:00:00Z".as_ref(),
+        ];
+        let header: &[u8] = b"solidus-rpc-test-credential";
+        let sig = sk.sign(header, &messages).expect("sign");
+        (sk, pk_bytes, sig, messages, header)
+    }
+
+    #[test]
+    fn bbs_verify_proof_happy_path() {
+        let (_sk, pk_bytes, sig, messages, header) = make_bbs_credential_fixtures();
+        let pk = solidus_crypto::bbs::BbsPublicKey::from_bytes(&pk_bytes).expect("pk");
+        let ph: &[u8] = b"verifier-presentation-header";
+
+        // Disclose did, country, kyc_level (indices 0, 3, 6).
+        let disclosed_indices = [0_usize, 3, 6];
+        let proof = sig
+            .create_proof(&pk, header, ph, &messages, &disclosed_indices)
+            .expect("proof_gen");
+
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let disclosed_messages: Vec<RpcDisclosedMessage> = disclosed_indices
+            .iter()
+            .map(|&i| RpcDisclosedMessage {
+                index: i as u32,
+                message: hex::encode(messages[i]),
+            })
+            .collect();
+
+        let valid = SolidusApiServer::bbs_verify_proof(
+            &rpc,
+            proof.to_hex(),
+            hex::encode(pk_bytes),
+            hex::encode(header),
+            hex::encode(ph),
+            disclosed_messages,
+            messages.len() as u32,
+        )
+        .expect("bbs_verify_proof");
+        assert!(valid, "fresh proof should verify");
+    }
+
+    #[test]
+    fn bbs_verify_proof_rejects_tampered_disclosed_message() {
+        let (_sk, pk_bytes, sig, messages, header) = make_bbs_credential_fixtures();
+        let pk = solidus_crypto::bbs::BbsPublicKey::from_bytes(&pk_bytes).expect("pk");
+        let ph: &[u8] = b"verifier-presentation-header";
+
+        let disclosed_indices = [0_usize, 3, 6];
+        let proof = sig
+            .create_proof(&pk, header, ph, &messages, &disclosed_indices)
+            .expect("proof_gen");
+
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        // Lie about the country: claim FR instead of GB.
+        let lied: Vec<RpcDisclosedMessage> = vec![
+            RpcDisclosedMessage { index: 0, message: hex::encode(messages[0]) },
+            RpcDisclosedMessage { index: 3, message: hex::encode(b"FR") },
+            RpcDisclosedMessage { index: 6, message: hex::encode(messages[6]) },
+        ];
+
+        let valid = SolidusApiServer::bbs_verify_proof(
+            &rpc,
+            proof.to_hex(),
+            hex::encode(pk_bytes),
+            hex::encode(header),
+            hex::encode(ph),
+            lied,
+            messages.len() as u32,
+        )
+        .expect("bbs_verify_proof");
+        assert!(!valid, "tampered disclosed message must not verify");
+    }
+
+    #[test]
+    fn bbs_verify_proof_rejects_invalid_pubkey_hex() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let result = SolidusApiServer::bbs_verify_proof(
+            &rpc,
+            "deadbeef".to_string(),
+            "not-hex".to_string(),
+            String::new(),
+            String::new(),
+            vec![],
+            0,
+        );
+        assert!(result.is_err(), "invalid pubkey hex must return error");
+    }
+
+    #[test]
+    fn bbs_verify_proof_rejects_index_out_of_range() {
+        let (_sk, pk_bytes, _sig, messages, _header) = make_bbs_credential_fixtures();
+
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let bogus = vec![
+            RpcDisclosedMessage { index: 99, message: hex::encode(b"hi") },
+        ];
+
+        let result = SolidusApiServer::bbs_verify_proof(
+            &rpc,
+            "00".to_string(),
+            hex::encode(pk_bytes),
+            String::new(),
+            String::new(),
+            bogus,
+            messages.len() as u32,
+        );
+        assert!(result.is_err(), "out-of-range index must be invalid_params");
+    }
+
+    #[test]
+    fn bbs_verify_credential_proof_unknown_credential() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let result = SolidusApiServer::bbs_verify_credential_proof(
+            &rpc,
+            "urn:solidus:credential:does-not-exist".to_string(),
+            "deadbeef".to_string(),
+            String::new(),
+            String::new(),
+            vec![],
+        )
+        .expect("call must not error");
+
+        assert!(!result.valid);
+        assert!(!result.proof_valid);
+        assert!(!result.is_bbs);
+        assert!(!result.revoked);
+        assert!(result.credential.is_none());
+    }
+
+    #[test]
+    fn bbs_verify_credential_proof_non_bbs_credential() {
+        use solidus_state::store::CF_CREDENTIALS;
+        use solidus_txns::credential::{CredentialRecord, CredentialType};
+
+        let (store, _dir) = open_tmp();
+        // Store a non-BBS credential (legacy / Ed25519).
+        let cred = CredentialRecord {
+            id: "urn:solidus:credential:legacy".to_string(),
+            issuer_did: "did:solidus:testnet:issuer".to_string(),
+            subject_did: "did:solidus:testnet:subject".to_string(),
+            credential_type: CredentialType::Email,
+            hash: [0u8; 32],
+            issued_ms: 1_000,
+            revoked: false,
+            revoked_ms: None,
+            bbs_pubkey: None,
+            bbs_message_count: None,
+        };
+        store.put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes()).unwrap();
+
+        let rpc = make_rpc(store);
+        let result = SolidusApiServer::bbs_verify_credential_proof(
+            &rpc,
+            cred.id.clone(),
+            "00".to_string(),
+            String::new(),
+            String::new(),
+            vec![],
+        )
+        .expect("call must not error");
+
+        assert!(!result.valid);
+        assert!(!result.proof_valid);
+        assert!(!result.is_bbs, "credential without bbs_pubkey is not BBS");
+        assert!(!result.revoked);
+        assert!(result.credential.is_some());
+    }
+
+    #[test]
+    fn bbs_verify_credential_proof_happy_path() {
+        use solidus_state::store::CF_CREDENTIALS;
+        use solidus_txns::credential::{CredentialRecord, CredentialType};
+
+        let (_sk, pk_bytes, sig, messages, header) = make_bbs_credential_fixtures();
+        let pk = solidus_crypto::bbs::BbsPublicKey::from_bytes(&pk_bytes).expect("pk");
+        let ph: &[u8] = b"happy-path-ph";
+        let disclosed_indices = [0_usize, 3, 6];
+        let proof = sig
+            .create_proof(&pk, header, ph, &messages, &disclosed_indices)
+            .expect("proof_gen");
+
+        // Persist a matching credential record on-chain.
+        let (store, _dir) = open_tmp();
+        let cred = CredentialRecord {
+            id: "urn:solidus:credential:bbs-test".to_string(),
+            issuer_did: "did:solidus:testnet:issuer".to_string(),
+            subject_did: "did:solidus:testnet:alice".to_string(),
+            credential_type: CredentialType::KycL2,
+            hash: [0xAA; 32],
+            issued_ms: 1_700_000_000_000,
+            revoked: false,
+            revoked_ms: None,
+            bbs_pubkey: Some(pk_bytes),
+            bbs_message_count: Some(messages.len() as u32),
+        };
+        store.put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes()).unwrap();
+
+        let rpc = make_rpc(store);
+        let disclosed_messages: Vec<RpcDisclosedMessage> = disclosed_indices
+            .iter()
+            .map(|&i| RpcDisclosedMessage {
+                index: i as u32,
+                message: hex::encode(messages[i]),
+            })
+            .collect();
+
+        let result = SolidusApiServer::bbs_verify_credential_proof(
+            &rpc,
+            cred.id.clone(),
+            proof.to_hex(),
+            hex::encode(header),
+            hex::encode(ph),
+            disclosed_messages,
+        )
+        .expect("call must not error");
+
+        assert!(result.valid, "fresh proof should be valid");
+        assert!(result.proof_valid);
+        assert!(result.is_bbs);
+        assert!(!result.revoked);
+        let rpc_cred = result.credential.expect("credential field");
+        assert_eq!(rpc_cred.bbs_message_count, Some(messages.len() as u32));
+        assert_eq!(rpc_cred.bbs_pubkey, Some(hex::encode(pk_bytes)));
+    }
+
+    #[test]
+    fn bbs_verify_credential_proof_revoked_marks_invalid() {
+        use solidus_state::store::CF_CREDENTIALS;
+        use solidus_txns::credential::{CredentialRecord, CredentialType};
+
+        let (_sk, pk_bytes, sig, messages, header) = make_bbs_credential_fixtures();
+        let pk = solidus_crypto::bbs::BbsPublicKey::from_bytes(&pk_bytes).expect("pk");
+        let ph: &[u8] = b"revoked-ph";
+        let disclosed_indices = [0_usize];
+        let proof = sig
+            .create_proof(&pk, header, ph, &messages, &disclosed_indices)
+            .expect("proof_gen");
+
+        let (store, _dir) = open_tmp();
+        let cred = CredentialRecord {
+            id: "urn:solidus:credential:bbs-revoked".to_string(),
+            issuer_did: "did:solidus:testnet:issuer".to_string(),
+            subject_did: "did:solidus:testnet:alice".to_string(),
+            credential_type: CredentialType::KycL1,
+            hash: [0; 32],
+            issued_ms: 1_000,
+            revoked: true, // revoked!
+            revoked_ms: Some(2_000),
+            bbs_pubkey: Some(pk_bytes),
+            bbs_message_count: Some(messages.len() as u32),
+        };
+        store.put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes()).unwrap();
+
+        let rpc = make_rpc(store);
+        let result = SolidusApiServer::bbs_verify_credential_proof(
+            &rpc,
+            cred.id.clone(),
+            proof.to_hex(),
+            hex::encode(header),
+            hex::encode(ph),
+            vec![RpcDisclosedMessage {
+                index: 0,
+                message: hex::encode(messages[0]),
+            }],
+        )
+        .expect("call must not error");
+
+        // Proof is cryptographically valid, but the credential is revoked.
+        assert!(result.proof_valid, "underlying proof is still valid crypto");
+        assert!(!result.valid, "valid=false because revoked");
+        assert!(result.is_bbs);
+        assert!(result.revoked);
     }
 }

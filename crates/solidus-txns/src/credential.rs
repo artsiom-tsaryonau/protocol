@@ -2,6 +2,34 @@ use serde::{Deserialize, Serialize};
 use solidus_crypto::hash::blake3_hash;
 use thiserror::Error;
 
+mod serde_bytes_96_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<[u8; 96]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => serializer.serialize_some(&bytes.as_slice()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 96]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<Vec<u8>> = Option::deserialize(deserializer)?;
+        match opt {
+            None => Ok(None),
+            Some(v) => v
+                .try_into()
+                .map(Some)
+                .map_err(|v: Vec<u8>| serde::de::Error::invalid_length(v.len(), &"96 bytes")),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CredentialType
 // ---------------------------------------------------------------------------
@@ -32,7 +60,19 @@ impl CredentialType {
             CredentialType::Reputation => 1_000_000,       // 0.01 SOLID
         }
     }
+
+    /// Return the issuance fee for a BBS+ credential of this type (in smallest units).
+    /// 1.25× the base fee — BBS records are larger and require pairing-based verification.
+    pub fn issue_fee_bbs(&self) -> u64 {
+        self.issue_fee() * 5 / 4
+    }
 }
+
+/// Maximum number of messages that can be signed in a single BBS+ credential.
+/// Caps the on-chain record size and proof complexity. Aligned with the
+/// initial Solidus KYC schema (8 fields). Increase via consensus-level
+/// upgrade if larger schemas are needed.
+pub const BBS_MAX_MESSAGE_COUNT: u32 = 64;
 
 // ---------------------------------------------------------------------------
 // CredentialRecord
@@ -57,6 +97,20 @@ pub struct CredentialRecord {
     pub revoked: bool,
     /// Unix timestamp (milliseconds) when the credential was revoked, if applicable.
     pub revoked_ms: Option<u64>,
+    /// BBS+ public key the issuer used to sign this credential's message vector.
+    /// `None` for traditional credentials whose payload is just an opaque hash.
+    /// 96 bytes = compressed BLS12-381 G2 point.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_bytes_96_opt"
+    )]
+    pub bbs_pubkey: Option<[u8; 96]>,
+    /// Number of BBS+ messages signed (the `total_message_count` a verifier
+    /// must supply when checking a selective-disclosure proof).
+    /// `None` when `bbs_pubkey` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbs_message_count: Option<u32>,
 }
 
 impl CredentialRecord {
@@ -92,6 +146,15 @@ pub enum CredentialError {
 
     #[error("sender is not the issuer of this credential")]
     NotIssuer,
+
+    #[error("BBS+ public key is malformed (not a valid compressed BLS12-381 G2 point)")]
+    InvalidBbsKey,
+
+    #[error("BBS+ message count {count} exceeds the maximum allowed ({max})")]
+    BbsMessageCountTooLarge { count: u32, max: u32 },
+
+    #[error("BBS+ message count must be at least 1")]
+    BbsMessageCountZero,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +216,67 @@ pub fn execute_credential_issue(
         issued_ms: timestamp_ms,
         revoked: false,
         revoked_ms: None,
+        bbs_pubkey: None,
+        bbs_message_count: None,
+    })
+}
+
+/// Execute a `CredentialIssueBbs` operation — issue a BBS+ credential.
+///
+/// The `bbs_pubkey` is the compressed BLS12-381 G2 point (96 bytes) the issuer
+/// used to sign the off-chain message vector. The `bbs_message_count` is the
+/// number of messages signed; verifiers need this to check selective-disclosure
+/// proofs.
+///
+/// Validates:
+/// - both DIDs are active
+/// - `bbs_pubkey` is a valid compressed G2 point (deserializes via [`solidus_crypto::bbs::BbsPublicKey`])
+/// - `bbs_message_count` is in `[1, BBS_MAX_MESSAGE_COUNT]`
+///
+/// The on-chain record commits to the issuer's BBS pubkey + the off-chain
+/// payload hash; verifying actual proofs is done via RPC, not on-chain.
+pub fn execute_credential_issue_bbs(
+    issuer_did: &str,
+    subject_did: &str,
+    credential_type: CredentialType,
+    hash: [u8; 32],
+    bbs_pubkey: [u8; 96],
+    bbs_message_count: u32,
+    issuer_did_active: bool,
+    subject_did_active: bool,
+    block_height: u64,
+    timestamp_ms: u64,
+) -> Result<CredentialRecord, CredentialError> {
+    if !issuer_did_active {
+        return Err(CredentialError::IssuerDidInvalid);
+    }
+    if !subject_did_active {
+        return Err(CredentialError::SubjectDidInvalid);
+    }
+    if bbs_message_count == 0 {
+        return Err(CredentialError::BbsMessageCountZero);
+    }
+    if bbs_message_count > BBS_MAX_MESSAGE_COUNT {
+        return Err(CredentialError::BbsMessageCountTooLarge {
+            count: bbs_message_count,
+            max: BBS_MAX_MESSAGE_COUNT,
+        });
+    }
+    solidus_crypto::bbs::BbsPublicKey::from_bytes(&bbs_pubkey)
+        .map_err(|_| CredentialError::InvalidBbsKey)?;
+
+    let id = build_credential_id(issuer_did, subject_did, &hash, block_height);
+    Ok(CredentialRecord {
+        id,
+        issuer_did: issuer_did.to_string(),
+        subject_did: subject_did.to_string(),
+        credential_type,
+        hash,
+        issued_ms: timestamp_ms,
+        revoked: false,
+        revoked_ms: None,
+        bbs_pubkey: Some(bbs_pubkey),
+        bbs_message_count: Some(bbs_message_count),
     })
 }
 
@@ -211,7 +335,16 @@ mod tests {
             issued_ms: 1_000_000,
             revoked: false,
             revoked_ms: None,
+            bbs_pubkey: None,
+            bbs_message_count: None,
         }
+    }
+
+    /// Helper: produce a valid BBS+ pubkey (96 bytes) for tests.
+    fn sample_bbs_pubkey() -> [u8; 96] {
+        use solidus_crypto::bbs::BbsSecretKey;
+        let sk = BbsSecretKey::from_ikm(b"solidus-credential-test-ikm-32-bytes-or-more").expect("ikm");
+        sk.public_key().to_bytes()
     }
 
     // -----------------------------------------------------------------------
@@ -391,5 +524,170 @@ mod tests {
         let bytes = original.to_bytes();
         let decoded = CredentialRecord::from_bytes(&bytes).expect("deserialization failed");
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn legacy_credential_record_deserializes_without_bbs_fields() {
+        // Old records (pre-BBS fields) must still deserialize cleanly.
+        let legacy_json = serde_json::json!({
+            "id": "urn:solidus:credential:legacy",
+            "issuer_did": "did:solidus:testnet:issuer",
+            "subject_did": "did:solidus:testnet:subject",
+            "credential_type": "KycL1",
+            "hash": [0xde, 0xad, 0xbe, 0xef, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+                      0,0,0,0,    0,0,0,0,    0,0,0,0,    0,0,0,0],
+            "issued_ms": 1_000_000_u64,
+            "revoked": false,
+            "revoked_ms": null
+        })
+        .to_string();
+        let decoded: CredentialRecord =
+            serde_json::from_str(&legacy_json).expect("legacy JSON must deserialize");
+        assert!(decoded.bbs_pubkey.is_none());
+        assert!(decoded.bbs_message_count.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_credential_issue_bbs tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn issue_bbs_credential_success() {
+        let pk = sample_bbs_pubkey();
+        let result = execute_credential_issue_bbs(
+            "did:solidus:testnet:issuer",
+            "did:solidus:testnet:subject",
+            CredentialType::KycL2,
+            sample_hash(),
+            pk,
+            8,
+            true,
+            true,
+            100,
+            1_700_000_000_000,
+        );
+        let record = result.expect("expected success");
+        assert_eq!(record.bbs_pubkey, Some(pk));
+        assert_eq!(record.bbs_message_count, Some(8));
+        assert!(!record.revoked);
+        assert_eq!(record.credential_type, CredentialType::KycL2);
+    }
+
+    #[test]
+    fn issue_bbs_credential_invalid_pubkey() {
+        let bad_pk = [0u8; 96]; // not a valid G2 point
+        let err = execute_credential_issue_bbs(
+            "did:solidus:testnet:issuer",
+            "did:solidus:testnet:subject",
+            CredentialType::Email,
+            sample_hash(),
+            bad_pk,
+            1,
+            true,
+            true,
+            100,
+            1_000,
+        )
+        .expect_err("expected InvalidBbsKey");
+        assert_eq!(err, CredentialError::InvalidBbsKey);
+    }
+
+    #[test]
+    fn issue_bbs_credential_zero_message_count() {
+        let err = execute_credential_issue_bbs(
+            "did:solidus:testnet:issuer",
+            "did:solidus:testnet:subject",
+            CredentialType::Email,
+            sample_hash(),
+            sample_bbs_pubkey(),
+            0,
+            true,
+            true,
+            100,
+            1_000,
+        )
+        .expect_err("expected BbsMessageCountZero");
+        assert_eq!(err, CredentialError::BbsMessageCountZero);
+    }
+
+    #[test]
+    fn issue_bbs_credential_message_count_too_large() {
+        let err = execute_credential_issue_bbs(
+            "did:solidus:testnet:issuer",
+            "did:solidus:testnet:subject",
+            CredentialType::Email,
+            sample_hash(),
+            sample_bbs_pubkey(),
+            BBS_MAX_MESSAGE_COUNT + 1,
+            true,
+            true,
+            100,
+            1_000,
+        )
+        .expect_err("expected BbsMessageCountTooLarge");
+        assert_eq!(
+            err,
+            CredentialError::BbsMessageCountTooLarge {
+                count: BBS_MAX_MESSAGE_COUNT + 1,
+                max: BBS_MAX_MESSAGE_COUNT,
+            }
+        );
+    }
+
+    #[test]
+    fn issue_bbs_credential_issuer_inactive() {
+        let err = execute_credential_issue_bbs(
+            "did:solidus:testnet:issuer",
+            "did:solidus:testnet:subject",
+            CredentialType::Email,
+            sample_hash(),
+            sample_bbs_pubkey(),
+            3,
+            false, // issuer inactive
+            true,
+            100,
+            1_000,
+        )
+        .expect_err("expected IssuerDidInvalid");
+        assert_eq!(err, CredentialError::IssuerDidInvalid);
+    }
+
+    #[test]
+    fn revoke_bbs_credential_success() {
+        let pk = sample_bbs_pubkey();
+        let issued = execute_credential_issue_bbs(
+            "did:solidus:testnet:issuer",
+            "did:solidus:testnet:subject",
+            CredentialType::KycL3,
+            sample_hash(),
+            pk,
+            12,
+            true,
+            true,
+            500,
+            1_700_000_000_000,
+        )
+        .expect("issue");
+
+        let revoked = execute_credential_revoke(
+            "did:solidus:testnet:issuer",
+            Some(&issued),
+            1_800_000_000_000,
+        )
+        .expect("revoke");
+
+        // BBS metadata is preserved through revocation.
+        assert!(revoked.revoked);
+        assert_eq!(revoked.revoked_ms, Some(1_800_000_000_000));
+        assert_eq!(revoked.bbs_pubkey, Some(pk));
+        assert_eq!(revoked.bbs_message_count, Some(12));
+    }
+
+    #[test]
+    fn issue_fee_bbs_is_125_percent_of_base() {
+        assert_eq!(CredentialType::Email.issue_fee_bbs(), 1_250_000);
+        assert_eq!(CredentialType::KycL1.issue_fee_bbs(), 125_000_000);
+        assert_eq!(CredentialType::KycL2.issue_fee_bbs(), 625_000_000);
+        assert_eq!(CredentialType::KycL3.issue_fee_bbs(), 2_500_000_000);
     }
 }

@@ -174,6 +174,13 @@ pub struct RpcCredentialRecord {
     pub issued_ms: u64,
     pub revoked: bool,
     pub revoked_ms: Option<u64>,
+    /// 96-byte BBS+ public key (hex), present only for BBS+ credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbs_pubkey: Option<String>,
+    /// Total number of messages signed by the BBS+ signature, present only
+    /// for BBS+ credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbs_message_count: Option<u32>,
 }
 
 impl RpcCredentialRecord {
@@ -188,6 +195,8 @@ impl RpcCredentialRecord {
             issued_ms: cred.issued_ms,
             revoked: cred.revoked,
             revoked_ms: cred.revoked_ms,
+            bbs_pubkey: cred.bbs_pubkey.map(hex::encode),
+            bbs_message_count: cred.bbs_message_count,
         }
     }
 }
@@ -372,4 +381,36 @@ mod tests {
         let rpc = RpcReceipt::from_receipt(&receipt);
         assert_eq!(rpc.status, "failed: insufficient balance");
     }
+}
+
+// ---------------------------------------------------------------------------
+// BBS+ RPC types
+// ---------------------------------------------------------------------------
+
+/// One disclosed message in a BBS+ proof. Index is the position in the
+/// original signed vector; message bytes are hex-encoded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcDisclosedMessage {
+    /// Position in the original signed message vector.
+    pub index: u32,
+    /// Hex-encoded message bytes.
+    pub message: String,
+}
+
+/// Result returned by `solidus_bbsVerifyCredentialProof`. Combines proof
+/// validity with on-chain credential state (revocation status, full record).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcCredentialProofResult {
+    /// `true` iff the proof verifies AND the credential is not revoked.
+    pub valid: bool,
+    /// `true` if the proof itself is cryptographically valid.
+    /// `valid` may be `false` while this is `true` if the credential
+    /// was revoked after proof generation.
+    pub proof_valid: bool,
+    /// `true` if the credential exists and carries a BBS+ pubkey.
+    pub is_bbs: bool,
+    /// `true` if the credential has been revoked.
+    pub revoked: bool,
+    /// The credential record on-chain (or `null` if not found).
+    pub credential: Option<RpcCredentialRecord>,
 }

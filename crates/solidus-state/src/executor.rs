@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use solidus_crypto::keys::Address;
-use solidus_txns::credential::{CredentialRecord, execute_credential_issue, execute_credential_revoke};
+use solidus_txns::credential::{
+    execute_credential_issue, execute_credential_issue_bbs, execute_credential_revoke,
+    CredentialRecord,
+};
 use solidus_txns::did::{DidDocument, execute_did_create, execute_did_update, execute_did_deactivate};
 use solidus_txns::staking::{ValidatorInfo, execute_stake, execute_unstake};
 use solidus_txns::token::execute_transfer;
@@ -391,6 +394,86 @@ pub fn execute_block(
                     &subject_did,
                     credential_type,
                     hash,
+                    issuer_active,
+                    subject_active,
+                    block_height,
+                    timestamp_ms,
+                ) {
+                    Ok(cred) => {
+                        let credential_id = cred.id.clone();
+                        let issuer_did_clone = cred.issuer_did.clone();
+                        let subject_did_clone = cred.subject_did.clone();
+
+                        save_credential(store, &cred).map_err(ExecutorError::Store)?;
+                        append_credential_index(store, CF_CRED_BY_SUBJECT, &subject_did_clone, &credential_id)
+                            .map_err(ExecutorError::Store)?;
+                        append_credential_index(store, CF_CRED_BY_ISSUER, &issuer_did_clone, &credential_id)
+                            .map_err(ExecutorError::Store)?;
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Success,
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![Event::CredentialIssued {
+                                credential_id,
+                                issuer: issuer_did_clone,
+                                subject: subject_did_clone,
+                            }],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                    Err(e) => {
+                        save_account(store, &sender)?;
+                        total_fees += fee;
+
+                        let receipt = Receipt {
+                            tx_hash,
+                            status: TxStatus::Failed(e.to_string()),
+                            block_height,
+                            fee_paid: fee,
+                            events: vec![],
+                        };
+                        store_receipt(store, &receipt)?;
+                        receipts.push(receipt);
+                    }
+                }
+            }
+            TxPayload::CredentialIssueBbs {
+                ref subject_did,
+                credential_type,
+                hash,
+                bbs_pubkey,
+                bbs_message_count,
+            } => {
+                let subject_did = subject_did.clone();
+                let credential_type = *credential_type;
+                let hash = *hash;
+                let bbs_pubkey = *bbs_pubkey;
+                let bbs_message_count = *bbs_message_count;
+
+                let issuer_did = solidus_txns::did::build_did("testnet", &sender_addr);
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                let issuer_doc = load_did(store, &issuer_did).map_err(ExecutorError::Store)?;
+                let subject_doc = load_did(store, &subject_did).map_err(ExecutorError::Store)?;
+
+                let issuer_active = issuer_doc.as_ref().map(|d| d.active).unwrap_or(false);
+                let subject_active = subject_doc.as_ref().map(|d| d.active).unwrap_or(false);
+
+                match execute_credential_issue_bbs(
+                    &issuer_did,
+                    &subject_did,
+                    credential_type,
+                    hash,
+                    bbs_pubkey,
+                    bbs_message_count,
                     issuer_active,
                     subject_active,
                     block_height,
@@ -1327,6 +1410,154 @@ mod tests {
 
         assert!(stored.revoked, "credential should be marked revoked");
         assert!(stored.revoked_ms.is_some(), "revoked_ms should be set");
+    }
+
+    /// Helper: build a signed CredentialIssueBbs transaction.
+    fn make_credential_issue_bbs_tx(
+        sender_key: &SigningKey,
+        subject_did: String,
+        credential_type: solidus_txns::credential::CredentialType,
+        hash: [u8; 32],
+        bbs_pubkey: [u8; 96],
+        bbs_message_count: u32,
+        nonce: u64,
+    ) -> Transaction {
+        let pubkey = sender_key.verifying_key().to_bytes();
+        let payload = TxPayload::CredentialIssueBbs {
+            subject_did,
+            credential_type,
+            hash,
+            bbs_pubkey,
+            bbs_message_count,
+        };
+
+        let mut tx = Transaction {
+            sender_pubkey: pubkey,
+            nonce,
+            payload,
+            signature: [0u8; 64],
+        };
+
+        let msg = tx.signing_bytes();
+        tx.signature = sign(sender_key, &msg);
+        tx
+    }
+
+    #[test]
+    fn credential_issue_bbs_via_executor() {
+        use solidus_crypto::bbs::BbsSecretKey;
+
+        let (store, _dir) = open_tmp();
+
+        let issuer_key = generate_signing_key();
+        let subject_key = generate_signing_key();
+
+        let issuer_addr = Address::from_public_key(&issuer_key.verifying_key());
+        let subject_addr = Address::from_public_key(&subject_key.verifying_key());
+
+        // Fund accounts (BBS issuance fee is 1.25× base; KycL2 base = 5 SOLID,
+        // so BBS = 6.25 SOLID = 625_000_000 smallest units).
+        fund_account(&store, issuer_addr, 1_000_000_000);
+        fund_account(&store, subject_addr, 1_000_000);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        let tx_issuer_did = make_did_create_tx(&issuer_key, 0);
+        execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[])
+            .expect("issuer DidCreate failed");
+
+        let tx_subject_did = make_did_create_tx(&subject_key, 0);
+        execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[])
+            .expect("subject DidCreate failed");
+
+        let bbs_sk = BbsSecretKey::from_ikm(b"executor-bbs-test-ikm-must-be-32-bytes-or-more").expect("ikm");
+        let bbs_pubkey = bbs_sk.public_key().to_bytes();
+
+        let subject_did = solidus_txns::did::build_did("testnet", &subject_addr);
+        let hash = [0xbbu8; 32];
+        let tx_issue = make_credential_issue_bbs_tx(
+            &issuer_key,
+            subject_did.clone(),
+            solidus_txns::credential::CredentialType::KycL2,
+            hash,
+            bbs_pubkey,
+            8,
+            1, // issuer nonce=1 after DidCreate
+        );
+
+        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[])
+            .expect("CredentialIssueBbs execute_block failed");
+
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].status,
+            TxStatus::Success,
+            "CredentialIssueBbs should succeed; got: {:?}",
+            receipts[0].status
+        );
+        assert_eq!(receipts[0].fee_paid, 625_000_000, "BBS fee should be 1.25× KycL2 base");
+
+        let credential_id = match &receipts[0].events[0] {
+            solidus_txns::types::Event::CredentialIssued { credential_id, .. } => credential_id.clone(),
+            other => panic!("expected CredentialIssued event, got: {:?}", other),
+        };
+
+        // Verify the stored credential carries BBS metadata.
+        let stored = load_credential(&store, &credential_id)
+            .expect("load_credential failed")
+            .expect("credential should be stored");
+        assert_eq!(stored.bbs_pubkey, Some(bbs_pubkey));
+        assert_eq!(stored.bbs_message_count, Some(8));
+        assert_eq!(stored.credential_type, solidus_txns::credential::CredentialType::KycL2);
+    }
+
+    #[test]
+    fn credential_issue_bbs_invalid_pubkey_fails_at_executor() {
+        let (store, _dir) = open_tmp();
+
+        let issuer_key = generate_signing_key();
+        let subject_key = generate_signing_key();
+        let issuer_addr = Address::from_public_key(&issuer_key.verifying_key());
+        let subject_addr = Address::from_public_key(&subject_key.verifying_key());
+
+        fund_account(&store, issuer_addr, 1_000_000_000);
+        fund_account(&store, subject_addr, 1_000_000);
+
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        execute_block(&store, &[make_did_create_tx(&issuer_key, 0)], 1, &treasury_addr, &[])
+            .expect("issuer DidCreate failed");
+        execute_block(&store, &[make_did_create_tx(&subject_key, 0)], 2, &treasury_addr, &[])
+            .expect("subject DidCreate failed");
+
+        let subject_did = solidus_txns::did::build_did("testnet", &subject_addr);
+        // All-zero bytes are not a valid compressed G2 point.
+        let bad_pubkey = [0u8; 96];
+        let tx_issue = make_credential_issue_bbs_tx(
+            &issuer_key,
+            subject_did,
+            solidus_txns::credential::CredentialType::Email,
+            [0u8; 32],
+            bad_pubkey,
+            3,
+            1,
+        );
+
+        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[])
+            .expect("execute_block must not error");
+
+        assert_eq!(receipts.len(), 1);
+        match &receipts[0].status {
+            TxStatus::Failed(reason) => {
+                assert!(
+                    reason.contains("BBS"),
+                    "expected BBS-related failure, got: {reason}"
+                );
+            }
+            TxStatus::Success => panic!("expected failure for invalid BBS pubkey"),
+        }
+        // Fee is still charged on failure.
+        assert!(receipts[0].fee_paid > 0);
     }
 
     // -----------------------------------------------------------------------

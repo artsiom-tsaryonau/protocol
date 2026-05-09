@@ -80,9 +80,30 @@ impl Store {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
+        // Conservative tuning for low disk + low RAM nodes (testnet validators on
+        // small VPS). RocksDB defaults are generous (64 MiB write buffer per CF,
+        // unbounded WAL, large SST targets) which causes dev-data to grow ~10 GiB
+        // an hour from empty-block churn alone. These caps keep growth bounded
+        // without meaningfully hurting throughput at the testnet block rate.
+        opts.set_max_total_wal_size(64 * 1024 * 1024); // 64 MiB total WAL across all CFs
+        opts.set_keep_log_file_num(1);                  // one rolling LOG, not 1000
+        opts.set_recycle_log_file_num(0);               // don't keep recycled WALs
+        opts.set_max_open_files(128);                   // bound fd usage
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_write_buffer_size(8 * 1024 * 1024);   // 8 MiB memtable per CF
+        opts.set_max_write_buffer_number(2);            // small flush queue
+        opts.set_target_file_size_base(8 * 1024 * 1024); // 8 MiB SSTs at L0
+        opts.set_max_bytes_for_level_base(64 * 1024 * 1024); // 64 MiB L1 cap
+        opts.set_level_compaction_dynamic_level_bytes(true); // smarter level sizing
+
+        let mut cf_opts = Options::default();
+        cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        cf_opts.set_write_buffer_size(4 * 1024 * 1024);
+        cf_opts.set_target_file_size_base(8 * 1024 * 1024);
+
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = COLUMN_FAMILIES
             .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+            .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)?;

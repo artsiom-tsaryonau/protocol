@@ -33,6 +33,28 @@ mod serde_bytes_64 {
     }
 }
 
+mod serde_bytes_96 {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 96], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 96], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        v.try_into()
+            .map_err(|v: Vec<u8>| {
+                serde::de::Error::invalid_length(v.len(), &"96 bytes")
+            })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fee constants (in smallest units; 1 SOLID = 10^8)
 // ---------------------------------------------------------------------------
@@ -91,6 +113,24 @@ pub enum TxPayload {
         /// BLAKE3 hash of the off-chain credential payload.
         hash: [u8; 32],
     },
+    /// Issue a BBS+ verifiable credential, enabling selective disclosure.
+    /// The issuer commits on-chain to a BBS+ public key over a fixed-length
+    /// message vector; the actual signature and messages live off-chain with
+    /// the subject. Verifiers later check selective-disclosure proofs against
+    /// the on-chain `bbs_pubkey`.
+    CredentialIssueBbs {
+        /// DID of the credential subject.
+        subject_did: String,
+        /// The type of credential being issued.
+        credential_type: CredentialType,
+        /// BLAKE3 hash of the off-chain credential payload.
+        hash: [u8; 32],
+        /// 96-byte compressed BLS12-381 G2 point (the BBS+ public key).
+        #[serde(with = "serde_bytes_96")]
+        bbs_pubkey: [u8; 96],
+        /// Number of messages signed.
+        bbs_message_count: u32,
+    },
     /// Revoke a previously issued credential. Only the original issuer may do this.
     CredentialRevoke {
         /// The unique credential identifier to revoke.
@@ -111,6 +151,7 @@ impl TxPayload {
             TxPayload::DidUpdate { .. } => FEE_DID_UPDATE,
             TxPayload::DidDeactivate { .. } => FEE_DID_DEACTIVATE,
             TxPayload::CredentialIssue { credential_type, .. } => credential_type.issue_fee(),
+            TxPayload::CredentialIssueBbs { credential_type, .. } => credential_type.issue_fee_bbs(),
             TxPayload::CredentialRevoke { .. } => FEE_CREDENTIAL_REVOKE,
             TxPayload::Stake { .. } => FEE_STAKE,
             TxPayload::Unstake { .. } => FEE_UNSTAKE,
@@ -334,5 +375,87 @@ mod tests {
 
         let expected = Address::from_public_key(&sender.verifying_key());
         assert_eq!(tx.sender_address(), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // CredentialIssueBbs tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bbs_credential_fee_uses_bbs_multiplier() {
+        let payload = TxPayload::CredentialIssueBbs {
+            subject_did: "did:solidus:testnet:subject".to_string(),
+            credential_type: CredentialType::KycL2,
+            hash: [0u8; 32],
+            bbs_pubkey: [0u8; 96],
+            bbs_message_count: 8,
+        };
+        // KycL2 base fee 5 SOLID = 500_000_000; BBS = 1.25x = 625_000_000
+        assert_eq!(payload.fee(), 625_000_000);
+    }
+
+    #[test]
+    fn bbs_credential_payload_serde_roundtrip() {
+        let original = TxPayload::CredentialIssueBbs {
+            subject_did: "did:solidus:testnet:subject".to_string(),
+            credential_type: CredentialType::KycL2,
+            hash: [0xAB; 32],
+            bbs_pubkey: [0xCD; 96],
+            bbs_message_count: 8,
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let decoded: TxPayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn bbs_credential_transaction_signature_verifies() {
+        let sender = generate_signing_key();
+        let payload = TxPayload::CredentialIssueBbs {
+            subject_did: "did:solidus:testnet:subject".to_string(),
+            credential_type: CredentialType::KycL1,
+            hash: [0x42; 32],
+            bbs_pubkey: [0x99; 96],
+            bbs_message_count: 5,
+        };
+        let mut tx = Transaction {
+            sender_pubkey: sender.verifying_key().to_bytes(),
+            nonce: 7,
+            payload,
+            signature: [0u8; 64],
+        };
+        let msg = tx.signing_bytes();
+        tx.signature = sign(&sender, &msg);
+        assert!(tx.verify_signature());
+    }
+
+    #[test]
+    fn bbs_credential_tampered_pubkey_breaks_signature() {
+        let sender = generate_signing_key();
+        let payload = TxPayload::CredentialIssueBbs {
+            subject_did: "did:solidus:testnet:subject".to_string(),
+            credential_type: CredentialType::KycL1,
+            hash: [0x42; 32],
+            bbs_pubkey: [0x99; 96],
+            bbs_message_count: 5,
+        };
+        let mut tx = Transaction {
+            sender_pubkey: sender.verifying_key().to_bytes(),
+            nonce: 7,
+            payload,
+            signature: [0u8; 64],
+        };
+        let msg = tx.signing_bytes();
+        tx.signature = sign(&sender, &msg);
+
+        // Tamper with the BBS pubkey.
+        tx.payload = TxPayload::CredentialIssueBbs {
+            subject_did: "did:solidus:testnet:subject".to_string(),
+            credential_type: CredentialType::KycL1,
+            hash: [0x42; 32],
+            bbs_pubkey: [0x88; 96], // changed
+            bbs_message_count: 5,
+        };
+        assert!(!tx.verify_signature());
     }
 }
