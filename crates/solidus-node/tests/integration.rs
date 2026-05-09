@@ -115,6 +115,7 @@ async fn transfer_via_rpc_updates_balance() {
         max_block_txs: 100,
         treasury_address: treasury_addr,
         validator_addresses: vec![validator_addr],
+        network: "testnet".to_string(),
     };
 
     let mut proposer = Proposer::new(

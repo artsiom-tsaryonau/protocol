@@ -152,6 +152,7 @@ pub fn execute_block(
     block_height: u64,
     treasury_address: &Address,
     validator_addresses: &[Address],
+    network: &str,
 ) -> Result<Vec<Receipt>, ExecutorError> {
     let mut receipts = Vec::with_capacity(transactions.len());
     let mut total_fees: u64 = 0;
@@ -279,7 +280,7 @@ pub fn execute_block(
                 }
             }
             TxPayload::DidCreate { ref public_key, ref service_endpoints } => {
-                let did_str = solidus_txns::did::build_did("testnet", &sender_addr);
+                let did_str = solidus_txns::did::build_did(network, &sender_addr);
                 let existing = load_did(store, &did_str).map_err(ExecutorError::Store)?;
                 let timestamp_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -291,7 +292,7 @@ pub fn execute_block(
                     service_endpoints.clone(),
                     existing.as_ref(),
                     timestamp_ms,
-                    "testnet",
+                    network,
                 ) {
                     Ok(result) => {
                         save_did(store, &result.did, &result.document)
@@ -340,6 +341,7 @@ pub fn execute_block(
                     patches,
                     existing.as_ref(),
                     timestamp_ms,
+                    network,
                 ) {
                     Ok(updated_doc) => {
                         save_did(store, did, &updated_doc).map_err(ExecutorError::Store)?;
@@ -377,7 +379,7 @@ pub fn execute_block(
                 let credential_type = *credential_type;
                 let hash = *hash;
 
-                let issuer_did = solidus_txns::did::build_did("testnet", &sender_addr);
+                let issuer_did = solidus_txns::did::build_did(network, &sender_addr);
                 let timestamp_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -455,7 +457,7 @@ pub fn execute_block(
                 let bbs_pubkey = *bbs_pubkey;
                 let bbs_message_count = *bbs_message_count;
 
-                let issuer_did = solidus_txns::did::build_did("testnet", &sender_addr);
+                let issuer_did = solidus_txns::did::build_did(network, &sender_addr);
                 let timestamp_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -524,7 +526,7 @@ pub fn execute_block(
             }
             TxPayload::CredentialRevoke { ref credential_id } => {
                 let credential_id = credential_id.clone();
-                let sender_did = solidus_txns::did::build_did("testnet", &sender_addr);
+                let sender_did = solidus_txns::did::build_did(network, &sender_addr);
                 let timestamp_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -677,6 +679,7 @@ pub fn execute_block(
                     did,
                     existing.as_ref(),
                     timestamp_ms,
+                    network,
                 ) {
                     Ok(deactivated_doc) => {
                         save_did(store, did, &deactivated_doc).map_err(ExecutorError::Store)?;
@@ -883,6 +886,7 @@ mod tests {
             1,
             &treasury_addr,
             &[validator_addr],
+            "testnet",
         )
         .expect("execute_block failed");
 
@@ -929,7 +933,7 @@ mod tests {
             signature: [0u8; 64],
         };
 
-        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block failed");
 
         assert_eq!(receipts.len(), 1);
@@ -962,7 +966,7 @@ mod tests {
         // Send with nonce=5, but account nonce is 0.
         let tx = make_transfer_tx(&sender_key, receiver_addr, 100, 5);
 
-        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block failed");
 
         assert_eq!(receipts.len(), 1);
@@ -1005,6 +1009,7 @@ mod tests {
             1,
             &treasury_addr,
             &[validator_addr],
+            "testnet",
         )
         .expect("execute_block failed");
 
@@ -1050,7 +1055,7 @@ mod tests {
 
         // First transfer (nonce=0)
         let tx1 = make_transfer_tx(&sender_key, receiver_addr, 100, 0);
-        let receipts1 = execute_block(&store, &[tx1], 1, &treasury_addr, &[])
+        let receipts1 = execute_block(&store, &[tx1], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block 1 failed");
         assert_eq!(receipts1[0].status, TxStatus::Success);
 
@@ -1059,7 +1064,7 @@ mod tests {
 
         // Second transfer (nonce=1)
         let tx2 = make_transfer_tx(&sender_key, receiver_addr, 200, 1);
-        let receipts2 = execute_block(&store, &[tx2], 2, &treasury_addr, &[])
+        let receipts2 = execute_block(&store, &[tx2], 2, &treasury_addr, &[], "testnet")
             .expect("execute_block 2 failed");
         assert_eq!(receipts2[0].status, TxStatus::Success);
 
@@ -1121,7 +1126,7 @@ mod tests {
         let treasury_addr = Address::from_bytes([0xAAu8; 20]);
 
         let tx = make_did_create_tx(&sender_key, 0);
-        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block failed");
 
         assert_eq!(receipts.len(), 1);
@@ -1157,13 +1162,13 @@ mod tests {
 
         // First create — should succeed.
         let tx1 = make_did_create_tx(&sender_key, 0);
-        let receipts1 = execute_block(&store, &[tx1], 1, &treasury_addr, &[])
+        let receipts1 = execute_block(&store, &[tx1], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block 1 failed");
         assert_eq!(receipts1[0].status, TxStatus::Success);
 
         // Second create with nonce=1 — should fail (DID already exists).
         let tx2 = make_did_create_tx(&sender_key, 1);
-        let receipts2 = execute_block(&store, &[tx2], 2, &treasury_addr, &[])
+        let receipts2 = execute_block(&store, &[tx2], 2, &treasury_addr, &[], "testnet")
             .expect("execute_block 2 failed");
 
         match &receipts2[0].status {
@@ -1193,7 +1198,7 @@ mod tests {
 
         // Step 1: Create the DID.
         let tx_create = make_did_create_tx(&sender_key, 0);
-        let receipts_create = execute_block(&store, &[tx_create], 1, &treasury_addr, &[])
+        let receipts_create = execute_block(&store, &[tx_create], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block (create) failed");
         assert_eq!(receipts_create[0].status, TxStatus::Success);
 
@@ -1202,7 +1207,7 @@ mod tests {
         // Step 2: Deactivate the DID.
         let tx_deactivate = make_did_deactivate_tx(&sender_key, expected_did.clone(), 1);
         let receipts_deactivate =
-            execute_block(&store, &[tx_deactivate], 2, &treasury_addr, &[])
+            execute_block(&store, &[tx_deactivate], 2, &treasury_addr, &[], "testnet")
                 .expect("execute_block (deactivate) failed");
 
         assert_eq!(receipts_deactivate[0].status, TxStatus::Success);
@@ -1286,13 +1291,13 @@ mod tests {
 
         // Step 1: Create issuer DID.
         let tx_issuer_did = make_did_create_tx(&issuer_key, 0);
-        let receipts = execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[], "testnet")
             .expect("issuer DidCreate failed");
         assert_eq!(receipts[0].status, TxStatus::Success, "issuer DID create should succeed");
 
         // Step 2: Create subject DID.
         let tx_subject_did = make_did_create_tx(&subject_key, 0);
-        let receipts = execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[], "testnet")
             .expect("subject DidCreate failed");
         assert_eq!(receipts[0].status, TxStatus::Success, "subject DID create should succeed");
 
@@ -1306,7 +1311,7 @@ mod tests {
             hash,
             1, // issuer nonce=1 after DidCreate
         );
-        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[], "testnet")
             .expect("CredentialIssue execute_block failed");
 
         assert_eq!(receipts.len(), 1);
@@ -1363,12 +1368,12 @@ mod tests {
 
         // Create issuer DID.
         let tx_issuer_did = make_did_create_tx(&issuer_key, 0);
-        execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[])
+        execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[], "testnet")
             .expect("issuer DidCreate failed");
 
         // Create subject DID.
         let tx_subject_did = make_did_create_tx(&subject_key, 0);
-        execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[])
+        execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[], "testnet")
             .expect("subject DidCreate failed");
 
         // Issue credential (issuer nonce=1).
@@ -1381,7 +1386,7 @@ mod tests {
             hash,
             1,
         );
-        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[], "testnet")
             .expect("CredentialIssue failed");
         assert_eq!(receipts[0].status, TxStatus::Success);
 
@@ -1392,7 +1397,7 @@ mod tests {
 
         // Revoke the credential (issuer nonce=2).
         let tx_revoke = make_credential_revoke_tx(&issuer_key, credential_id.clone(), 2);
-        let receipts = execute_block(&store, &[tx_revoke], 4, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_revoke], 4, &treasury_addr, &[], "testnet")
             .expect("CredentialRevoke failed");
 
         assert_eq!(receipts.len(), 1);
@@ -1463,11 +1468,11 @@ mod tests {
         let treasury_addr = Address::from_bytes([0xAAu8; 20]);
 
         let tx_issuer_did = make_did_create_tx(&issuer_key, 0);
-        execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[])
+        execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[], "testnet")
             .expect("issuer DidCreate failed");
 
         let tx_subject_did = make_did_create_tx(&subject_key, 0);
-        execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[])
+        execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[], "testnet")
             .expect("subject DidCreate failed");
 
         let bbs_sk = BbsSecretKey::from_ikm(b"executor-bbs-test-ikm-must-be-32-bytes-or-more").expect("ikm");
@@ -1485,7 +1490,7 @@ mod tests {
             1, // issuer nonce=1 after DidCreate
         );
 
-        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[], "testnet")
             .expect("CredentialIssueBbs execute_block failed");
 
         assert_eq!(receipts.len(), 1);
@@ -1525,9 +1530,9 @@ mod tests {
 
         let treasury_addr = Address::from_bytes([0xAAu8; 20]);
 
-        execute_block(&store, &[make_did_create_tx(&issuer_key, 0)], 1, &treasury_addr, &[])
+        execute_block(&store, &[make_did_create_tx(&issuer_key, 0)], 1, &treasury_addr, &[], "testnet")
             .expect("issuer DidCreate failed");
-        execute_block(&store, &[make_did_create_tx(&subject_key, 0)], 2, &treasury_addr, &[])
+        execute_block(&store, &[make_did_create_tx(&subject_key, 0)], 2, &treasury_addr, &[], "testnet")
             .expect("subject DidCreate failed");
 
         let subject_did = solidus_txns::did::build_did("testnet", &subject_addr);
@@ -1543,7 +1548,7 @@ mod tests {
             1,
         );
 
-        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[], "testnet")
             .expect("execute_block must not error");
 
         assert_eq!(receipts.len(), 1);
@@ -1616,7 +1621,7 @@ mod tests {
         let treasury_addr = Address::from_bytes([0xAAu8; 20]);
 
         let tx = make_stake_tx(&sender_key, MIN_STAKE, 0);
-        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block failed");
 
         assert_eq!(receipts.len(), 1);
@@ -1674,7 +1679,7 @@ mod tests {
 
         // Step 1: Stake.
         let tx_stake = make_stake_tx(&sender_key, MIN_STAKE, 0);
-        let receipts = execute_block(&store, &[tx_stake], 1, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_stake], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block (stake) failed");
         assert_eq!(
             receipts[0].status,
@@ -1692,7 +1697,7 @@ mod tests {
 
         // Step 2: Fully unstake (nonce=1).
         let tx_unstake = make_unstake_tx(&sender_key, MIN_STAKE, 1);
-        let receipts = execute_block(&store, &[tx_unstake], 2, &treasury_addr, &[])
+        let receipts = execute_block(&store, &[tx_unstake], 2, &treasury_addr, &[], "testnet")
             .expect("execute_block (unstake) failed");
 
         assert_eq!(receipts.len(), 1);
@@ -1751,7 +1756,7 @@ mod tests {
         fund_account(&store, sender_addr, 1_000_000);
 
         let tx = make_transfer_tx(&sender_key, receiver_addr, 500, 0);
-        execute_block(&store, &[tx], 1, &treasury_addr, &[])
+        execute_block(&store, &[tx], 1, &treasury_addr, &[], "testnet")
             .expect("execute_block failed");
 
         let root_after = compute_state_root(&store).expect("compute_state_root failed");

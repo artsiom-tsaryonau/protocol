@@ -99,6 +99,7 @@ async fn create_did_and_resolve_via_rpc() {
         1,
         &treasury_addr,
         &[validator_addr],
+        "testnet",
     )
     .expect("execute_block failed");
 

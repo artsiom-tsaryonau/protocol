@@ -130,7 +130,7 @@ async fn issue_credential_and_verify_via_rpc() {
     // 4. Create issuer DID (block 1)
     // -----------------------------------------------------------------------
     let tx_issuer_did = make_did_create_tx(&issuer_key, 0);
-    let receipts = execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[validator_addr])
+    let receipts = execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[validator_addr], "testnet")
         .expect("issuer DidCreate execute_block failed");
     assert_eq!(receipts.len(), 1);
     assert_eq!(
@@ -145,7 +145,7 @@ async fn issue_credential_and_verify_via_rpc() {
     // 5. Create subject DID (block 2)
     // -----------------------------------------------------------------------
     let tx_subject_did = make_did_create_tx(&subject_key, 0);
-    let receipts = execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[validator_addr])
+    let receipts = execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[validator_addr], "testnet")
         .expect("subject DidCreate execute_block failed");
     assert_eq!(receipts.len(), 1);
     assert_eq!(
@@ -171,7 +171,7 @@ async fn issue_credential_and_verify_via_rpc() {
         1, // issuer nonce=1 (after DidCreate)
     );
 
-    let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[validator_addr])
+    let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[validator_addr], "testnet")
         .expect("CredentialIssue execute_block failed");
     assert_eq!(receipts.len(), 1);
     assert_eq!(

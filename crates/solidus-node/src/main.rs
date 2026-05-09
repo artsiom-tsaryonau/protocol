@@ -190,12 +190,21 @@ async fn run_node(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // 6. Compute genesis_hash = blake3_hash(chain_id.as_bytes())
     let genesis_hash = blake3_hash(chain_id.as_bytes());
 
+    // chain_id format: "solidus-{network}-{seq}" — extract network so DID
+    // strings on this chain say `did:solidus:{network}:...` correctly.
+    let network = chain_id
+        .strip_prefix("solidus-")
+        .and_then(|s| s.rsplit_once('-').map(|(prefix, _)| prefix))
+        .unwrap_or("testnet")
+        .to_string();
+
     // 7. Create and spawn Proposer
     let proposer_config = ProposerConfig {
         block_time_ms: cfg.block_time_ms,
         max_block_txs: cfg.max_block_txs,
         treasury_address,
         validator_addresses,
+        network,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -701,12 +710,16 @@ async fn handle_consensus_message(
             }
 
             // Execute the block's transactions for potential commit.
+            // The HotStuff config doesn't carry a network field today; fall
+            // back to "testnet" (matches dev_testnet usage). When/if mainnet
+            // ships, plumb the network through HotStuffConfig.
             let receipts = solidus_state::executor::execute_block(
                 &engine.store,
                 &block.transactions,
                 block.header.height,
                 &engine.config.treasury_address,
                 &[], // validator addresses for fee distribution
+                "testnet",
             )
             .unwrap_or_default();
 

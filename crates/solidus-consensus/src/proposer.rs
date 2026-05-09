@@ -29,6 +29,10 @@ pub struct ProposerConfig {
     pub treasury_address: Address,
     /// Addresses that receive the validator share of fees.
     pub validator_addresses: Vec<Address>,
+    /// Network identifier used in DID strings (`testnet`, `mainnet`, etc.).
+    /// Threaded through to `execute_block` so DID handlers no longer
+    /// hardcode `"testnet"`.
+    pub network: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +101,7 @@ impl Proposer {
             new_height,
             &self.config.treasury_address,
             &self.config.validator_addresses,
+            &self.config.network,
         )?;
 
         // Compute state root after execution.
@@ -265,19 +270,26 @@ mod tests {
             max_block_txs: 100,
             treasury_address: Address::from_bytes([0xAAu8; 20]),
             validator_addresses: vec![Address::from_bytes([0xBBu8; 20])],
+            network: "testnet".to_string(),
         };
         Proposer::new(store, mempool, config, 0, [0u8; 32])
     }
 
     #[test]
-    fn no_txs_produces_no_block() {
+    fn no_txs_produces_empty_block() {
+        // Updated 2026-05-09: the proposer now produces empty blocks when
+        // the mempool is empty, to maintain chain liveness (height advances
+        // for the explorer indexer, time-based SDK ops, and consistent
+        // block intervals). The previous assertion `is_none()` was stale.
         let (store, _dir) = open_tmp();
         let mempool = Arc::new(Mutex::new(Mempool::new()));
         let mut proposer = make_proposer(store, mempool);
 
         let result = proposer.propose_block().expect("propose_block failed");
-        assert!(result.is_none());
-        assert_eq!(proposer.current_height(), 0);
+        let (block, receipts) = result.expect("empty mempool must still produce a block");
+        assert_eq!(block.header.tx_count, 0);
+        assert!(receipts.is_empty());
+        assert_eq!(proposer.current_height(), 1);
     }
 
     #[test]

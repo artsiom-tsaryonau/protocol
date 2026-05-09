@@ -104,6 +104,7 @@ async fn stake_and_query_via_rpc() {
         1,
         &treasury_addr,
         &[block_validator_addr],
+        "testnet",
     )
     .expect("execute_block (stake) failed");
 
