@@ -1,0 +1,10 @@
+    Finished `release` profile [optimized] target(s) in 0.10s
+     Running tests/twolane_vs_oracle.rs (target/release/deps/twolane_vs_oracle-be09ce9aab8fe424)
+
+running 1 test
+test randomized_v2_streams_zero_divergence has been running for over 60 seconds
+two-lane vs oracle: 2186046 transactions across 1000 streams × 100 blocks — zero divergence
+test randomized_v2_streams_zero_divergence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 310.70s
+

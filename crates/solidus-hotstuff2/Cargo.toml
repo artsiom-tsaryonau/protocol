@@ -1,0 +1,22 @@
+[package]
+name = "solidus-hotstuff2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HotStuff-2 (2-chain) BFT consensus for Solidus v2: pure event-driven core, sub-second pacemaker, gossip-shaped dissemination"
+
+[dependencies]
+solidus-crypto = { workspace = true }
+solidus-mempool-dag = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "consensus"
+harness = false

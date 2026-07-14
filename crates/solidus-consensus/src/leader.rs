@@ -90,8 +90,16 @@ pub fn verify_leader(
     proof: &VrfProof,
 ) -> bool {
     let input = vrf_input(round_seed, round);
-    let pk = ed25519_dalek::VerifyingKey::from_bytes(&validator.ed25519_pubkey)
-        .expect("valid ed25519 pubkey in validator identity");
+    // A malformed ed25519 pubkey in the validator identity record means
+    // the claimed identity is bogus -> the leader election simply fails
+    // verification rather than panicking the node. Real production validators
+    // pass through genesis/staking-tx validation which already enforces
+    // pubkey validity; this guards against bad in-memory entries (e.g. a
+    // forked state corruption surfacing through this read path).
+    let pk = match ed25519_dalek::VerifyingKey::from_bytes(&validator.ed25519_pubkey) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
     vrf_verify(&pk, &input, claimed_output, proof)
 }
 
@@ -110,11 +118,17 @@ pub fn verify_leader(
 /// Panics if `outputs` is empty. The caller must ensure the validator set is
 /// non-empty before calling this function.
 pub fn select_leader_from_outputs(outputs: &[(usize, VrfOutput)]) -> usize {
+    // Empty outputs is a caller-side bug, not a network-input failure:
+    // `validators` in HotStuffEngine is built from genesis/staking-tx data
+    // which always has ≥1 validator. The expect is documented as a precondition
+    // (see #Panics above) and we keep it as an assertion to flag a logic bug
+    // immediately rather than silently returning a wrong leader.
+    #[allow(clippy::expect_used)]
     outputs
         .iter()
         .min_by_key(|(_, out)| vrf_output_to_u64(out))
         .map(|(idx, _)| *idx)
-        .expect("non-empty validator set")
+        .expect("non-empty validator set (caller precondition)")
 }
 
 // ---------------------------------------------------------------------------

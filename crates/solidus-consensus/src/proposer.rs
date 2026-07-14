@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use solidus_crypto::keys::Address;
-use solidus_state::executor::{execute_block, compute_state_root};
+use solidus_state::executor::{compute_state_root, execute_block};
 use solidus_state::store::{Store, CF_BLOCKS, CF_HEADERS};
 use solidus_txns::types::Receipt;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::mempool::Mempool;
-use crate::types::{Block, BlockHeader, compute_transactions_root};
+use crate::types::{compute_transactions_root, Block, BlockHeader};
 
 /// Result type for block proposal: `(Block, Vec<Receipt>)`.
 type ProposalResult = (Block, Vec<Receipt>);
@@ -80,9 +80,18 @@ impl Proposer {
     /// Returns `Ok(Some((block, receipts)))` if a block was produced, or
     /// `Ok(None)` if the mempool was empty.
     pub fn propose_block(&mut self) -> Result<Option<ProposalResult>, Box<dyn Error>> {
-        // Take transactions from the mempool.
+        // Take transactions from the mempool. Recover from a poisoned mutex
+        // (a previous holder panicked) by extracting the inner Mempool —
+        // its state is plain data (Vec + HashSet); safe to read. See the
+        // matching pattern in HotStuffEngine::build_block.
         let txs = {
-            let mut pool = self.mempool.lock().expect("mempool lock poisoned");
+            let mut pool = match self.mempool.lock() {
+                Ok(p) => p,
+                Err(poisoned) => {
+                    tracing::warn!("mempool lock poisoned; recovering inner state");
+                    poisoned.into_inner()
+                }
+            };
             pool.take(self.config.max_block_txs)
         };
 
@@ -94,11 +103,22 @@ impl Proposer {
 
         let new_height = self.current_height + 1;
 
+        // Block timestamp (ms since epoch). Computed ONCE here so the same
+        // value feeds both execution (DID/credential `created_ms` must be
+        // identical across the proposer and every re-executing validator, or
+        // the state roots diverge) and the header below. Defensive 0 fallback
+        // on a pre-1970 clock rather than panic. Matches HotStuffEngine::build_block.
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         // Execute the block against the state store.
         let receipts = execute_block(
             &self.store,
             &txs,
             new_height,
+            timestamp_ms,
             &self.config.treasury_address,
             &self.config.validator_addresses,
             &self.config.network,
@@ -109,10 +129,6 @@ impl Proposer {
 
         // Build the block header.
         let transactions_root = compute_transactions_root(&txs);
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_millis() as u64;
 
         let header = BlockHeader {
             height: new_height,
@@ -140,8 +156,7 @@ impl Proposer {
             .put(CF_BLOCKS, &new_height.to_le_bytes(), &block_bytes)?;
 
         let header_bytes = serde_json::to_vec(&block.header)?;
-        self.store
-            .put(CF_HEADERS, &block_hash, &header_bytes)?;
+        self.store.put(CF_HEADERS, &block_hash, &header_bytes)?;
 
         // Advance chain tip.
         self.current_height = new_height;
@@ -261,10 +276,7 @@ mod tests {
         save_account(store, &account).expect("fund_account failed");
     }
 
-    fn make_proposer(
-        store: Arc<Store>,
-        mempool: Arc<Mutex<Mempool>>,
-    ) -> Proposer {
+    fn make_proposer(store: Arc<Store>, mempool: Arc<Mutex<Mempool>>) -> Proposer {
         let config = ProposerConfig {
             block_time_ms: 1000,
             max_block_txs: 100,

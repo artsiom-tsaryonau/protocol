@@ -1,0 +1,5 @@
+Hardware: Apple M4, 10 cores, 16 GB RAM, NVMe
+OS: macOS 15.7.3 (Darwin 24.6.0)
+rustc: rustc 1.96.0-nightly (fda6d37bb 2026-03-27)
+Captured: 2026-07-13
+Branch: feat/l1-v2-two-lane @ 2bbb7818

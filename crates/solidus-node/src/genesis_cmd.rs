@@ -9,6 +9,8 @@ use solidus_crypto::bls::BlsSecretKey;
 use solidus_crypto::ed25519::generate_signing_key;
 use solidus_crypto::keys::Address;
 
+use crate::genesis::NativeTokenMetadata;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -16,6 +18,10 @@ use solidus_crypto::keys::Address;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisFile {
     pub chain_id: String,
+    /// Native token metadata. Serialized here so generated `genesis.json`
+    /// files self-describe the token; `GenesisConfig` reads the same field
+    /// back at node startup.
+    pub native_token: NativeTokenMetadata,
     pub timestamp: String,
     pub round_seed: String,
     pub validators: Vec<GenesisValidator>,
@@ -34,6 +40,11 @@ pub struct GenesisValidator {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisParams {
+    /// HISTORICAL — kept only for genesis.json file-format compatibility.
+    /// Consensus proposing has been event-driven since 2026-07-13 (propose
+    /// on work + idle heartbeat); NOTHING reads this value. Changing it in
+    /// a genesis file is a no-op — do not "tune" it expecting a change in
+    /// block cadence.
     pub block_time_ms: u64,
     pub committee_size: usize,
     pub quorum_threshold: usize,
@@ -71,11 +82,22 @@ pub fn generate_genesis(
     let mut validators = Vec::with_capacity(num_validators);
     let mut initial_balances: HashMap<String, u64> = HashMap::new();
 
-    let validator_stake: u64 = 10_000_000 * 100_000_000; // 10M SOLID
+    let validator_stake: u64 = 10_000_000 * 100_000_000; // 10M SLDS
 
-    for i in 0..num_validators {
-        // Ed25519 key pair
-        let ed_signing_key = generate_signing_key();
+    // Pre-generate every validator's Ed25519 key so each config can list every
+    // peer's libp2p PeerId (derived deterministically from its node.key).
+    let ed_signing_keys: Vec<_> = (0..num_validators)
+        .map(|_| generate_signing_key())
+        .collect();
+    let peer_ids: Vec<String> = ed_signing_keys
+        .iter()
+        .map(|sk| {
+            solidus_p2p::identity::libp2p_keypair_from_node_seed(&sk.to_bytes())
+                .map(|kp| kp.public().to_peer_id().to_base58())
+        })
+        .collect::<Result<_, _>>()?;
+
+    for (i, ed_signing_key) in ed_signing_keys.iter().enumerate() {
         let ed_verifying_key = ed_signing_key.verifying_key();
         let ed_secret_hex = hex::encode(ed_signing_key.to_bytes());
         let ed_public_hex = hex::encode(ed_verifying_key.to_bytes());
@@ -100,17 +122,14 @@ pub fn generate_genesis(
         // Write bls.key (bls secret, hex)
         fs::write(val_dir.join("bls.key"), &bls_secret_hex)?;
 
-        // Build peer list (all validators except self)
-        let peers: Vec<(usize, u16)> = (0..num_validators)
+        // Build peer list (all validators except self) with derived PeerIds.
+        let peer_entries: String = (0..num_validators)
             .filter(|&j| j != i)
-            .map(|j| (j, 30300 + j as u16))
-            .collect();
-
-        let peer_entries: String = peers
-            .iter()
-            .map(|(idx, port)| {
+            .map(|j| {
+                let port = 30300 + j as u16;
                 format!(
-                    "\n[[peers]]\nindex = {idx}\naddress = \"127.0.0.1:{port}\"\n"
+                    "\n[[peers]]\nindex = {j}\npeer_id = \"{}\"\naddress = \"/ip4/127.0.0.1/tcp/{port}\"\n",
+                    peer_ids[j]
                 )
             })
             .collect::<Vec<_>>()
@@ -153,17 +172,16 @@ node_index = {i}
     let treasury_secret_hex = hex::encode(treasury_signing_key.to_bytes());
     fs::write(output_dir.join("treasury.key"), &treasury_secret_hex)?;
 
-    let treasury_balance: u64 = 50_000_000 * 100_000_000; // 50M SOLID
+    let treasury_balance: u64 = 50_000_000 * 100_000_000; // 50M SLDS
     initial_balances.insert(treasury_address.clone(), treasury_balance);
 
     // --- Generate faucet key ---
     let faucet_signing_key = generate_signing_key();
-    let faucet_address =
-        Address::from_public_key(&faucet_signing_key.verifying_key()).to_base58();
+    let faucet_address = Address::from_public_key(&faucet_signing_key.verifying_key()).to_base58();
     let faucet_secret_hex = hex::encode(faucet_signing_key.to_bytes());
     fs::write(output_dir.join("faucet.key"), &faucet_secret_hex)?;
 
-    let faucet_balance: u64 = 20_000_000 * 100_000_000; // 20M SOLID
+    let faucet_balance: u64 = 20_000_000 * 100_000_000; // 20M SLDS
     initial_balances.insert(faucet_address.clone(), faucet_balance);
 
     // --- Quorum threshold: (n * 2 / 3) + 1 ---
@@ -186,6 +204,11 @@ node_index = {i}
     // --- GenesisFile ---
     let genesis = GenesisFile {
         chain_id: chain_id.to_string(),
+        native_token: NativeTokenMetadata {
+            symbol: "SLDS".to_string(),
+            name: "Solidus".to_string(),
+            decimals: 8,
+        },
         timestamp,
         round_seed: round_seed_hex,
         validators,
@@ -264,7 +287,7 @@ fn unix_to_datetime(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 }
 
 fn is_leap(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 // ---------------------------------------------------------------------------
@@ -282,20 +305,23 @@ mod tests {
         let dir = tempdir().expect("failed to create temp dir");
         let output = dir.path();
 
-        generate_genesis(4, output, "solidus-testnet-1")
-            .expect("generate_genesis failed");
+        generate_genesis(4, output, "solidus-testnet-1").expect("generate_genesis failed");
 
         // --- genesis.json exists and parses ---
         let genesis_path = output.join("genesis.json");
         assert!(genesis_path.exists(), "genesis.json missing");
 
-        let genesis_str =
-            fs::read_to_string(&genesis_path).expect("failed to read genesis.json");
+        let genesis_str = fs::read_to_string(&genesis_path).expect("failed to read genesis.json");
         let genesis: GenesisFile =
             serde_json::from_str(&genesis_str).expect("failed to parse genesis.json");
 
         // --- 4 validators ---
         assert_eq!(genesis.validators.len(), 4, "expected 4 validators");
+
+        // --- native_token block emitted ---
+        assert_eq!(genesis.native_token.symbol, "SLDS");
+        assert_eq!(genesis.native_token.name, "Solidus");
+        assert_eq!(genesis.native_token.decimals, 8);
 
         // --- quorum threshold = (4 * 2 / 3) + 1 = 3 ---
         assert_eq!(
@@ -306,10 +332,7 @@ mod tests {
         // --- each validator dir has node.key, bls.key, config.toml ---
         for i in 0..4 {
             let val_dir = output.join(format!("validator-{i}"));
-            assert!(
-                val_dir.exists(),
-                "validator-{i} directory missing"
-            );
+            assert!(val_dir.exists(), "validator-{i} directory missing");
             assert!(
                 val_dir.join("node.key").exists(),
                 "validator-{i}/node.key missing"
@@ -337,12 +360,38 @@ mod tests {
     }
 
     #[test]
+    fn genesis_emits_peer_ids_and_multiaddrs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        generate_genesis(2, dir.path(), "solidus-testnet-1").expect("genesis");
+
+        // validator-0's config must list validator-1 as a peer, with the
+        // peer_id derived from validator-1's node.key and a multiaddr address.
+        let cfg0 = std::fs::read_to_string(dir.path().join("validator-0/config.toml")).unwrap();
+        assert!(cfg0.contains("peer_id ="), "config must emit peer_id");
+        assert!(
+            cfg0.contains("/ip4/127.0.0.1/tcp/"),
+            "address must be a multiaddr"
+        );
+
+        let node1_key = std::fs::read_to_string(dir.path().join("validator-1/node.key")).unwrap();
+        let seed: [u8; 32] = hex::decode(node1_key.trim()).unwrap().try_into().unwrap();
+        let expected_pid = solidus_p2p::identity::libp2p_keypair_from_node_seed(&seed)
+            .unwrap()
+            .public()
+            .to_peer_id()
+            .to_base58();
+        assert!(
+            cfg0.contains(&expected_pid),
+            "validator-0 config must contain validator-1's derived PeerId {expected_pid}"
+        );
+    }
+
+    #[test]
     fn genesis_validator_keys_are_unique() {
         let dir = tempdir().expect("failed to create temp dir");
         let output = dir.path();
 
-        generate_genesis(4, output, "solidus-testnet-1")
-            .expect("generate_genesis failed");
+        generate_genesis(4, output, "solidus-testnet-1").expect("generate_genesis failed");
 
         let genesis_str =
             fs::read_to_string(output.join("genesis.json")).expect("failed to read genesis.json");

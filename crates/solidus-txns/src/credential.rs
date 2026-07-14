@@ -48,16 +48,16 @@ pub enum CredentialType {
 
 impl CredentialType {
     /// Return the issuance fee for this credential type (in smallest units).
-    /// 1 SOLID = 100_000_000 (10^8).
+    /// 1 SLDS = 100_000_000 (10^8).
     pub fn issue_fee(&self) -> u64 {
         match self {
-            CredentialType::Email      => 1_000_000,       // 0.01 SOLID
-            CredentialType::Phone      => 2_000_000,       // 0.02 SOLID
-            CredentialType::KycL1      => 100_000_000,     // 1.0 SOLID
-            CredentialType::KycL2      => 500_000_000,     // 5.0 SOLID
-            CredentialType::KycL3      => 2_000_000_000,   // 20.0 SOLID
-            CredentialType::Age        => 5_000_000,       // 0.05 SOLID
-            CredentialType::Reputation => 1_000_000,       // 0.01 SOLID
+            CredentialType::Email => 1_000_000,      // 0.01 SLDS
+            CredentialType::Phone => 2_000_000,      // 0.02 SLDS
+            CredentialType::KycL1 => 100_000_000,    // 1.0 SLDS
+            CredentialType::KycL2 => 500_000_000,    // 5.0 SLDS
+            CredentialType::KycL3 => 2_000_000_000,  // 20.0 SLDS
+            CredentialType::Age => 5_000_000,        // 0.05 SLDS
+            CredentialType::Reputation => 1_000_000, // 0.01 SLDS
         }
     }
 
@@ -170,9 +170,7 @@ pub fn build_credential_id(
     hash: &[u8; 32],
     height: u64,
 ) -> String {
-    let mut input = Vec::with_capacity(
-        issuer_did.len() + subject_did.len() + 32 + 8,
-    );
+    let mut input = Vec::with_capacity(issuer_did.len() + subject_did.len() + 32 + 8);
     input.extend_from_slice(issuer_did.as_bytes());
     input.extend_from_slice(subject_did.as_bytes());
     input.extend_from_slice(hash);
@@ -189,6 +187,7 @@ pub fn build_credential_id(
 ///
 /// Returns a new [`CredentialRecord`] on success, or a [`CredentialError`] if
 /// either DID is inactive.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_credential_issue(
     issuer_did: &str,
     subject_did: &str,
@@ -235,6 +234,7 @@ pub fn execute_credential_issue(
 ///
 /// The on-chain record commits to the issuer's BBS pubkey + the off-chain
 /// payload hash; verifying actual proofs is done via RPC, not on-chain.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_credential_issue_bbs(
     issuer_did: &str,
     subject_did: &str,
@@ -288,8 +288,7 @@ pub fn execute_credential_revoke(
     credential: Option<&CredentialRecord>,
     timestamp_ms: u64,
 ) -> Result<CredentialRecord, CredentialError> {
-    let cred = credential
-        .ok_or_else(|| CredentialError::NotFound("unknown".to_string()))?;
+    let cred = credential.ok_or_else(|| CredentialError::NotFound("unknown".to_string()))?;
 
     if cred.revoked {
         return Err(CredentialError::AlreadyRevoked(cred.id.clone()));
@@ -343,7 +342,8 @@ mod tests {
     /// Helper: produce a valid BBS+ pubkey (96 bytes) for tests.
     fn sample_bbs_pubkey() -> [u8; 96] {
         use solidus_crypto::bbs::BbsSecretKey;
-        let sk = BbsSecretKey::from_ikm(b"solidus-credential-test-ikm-32-bytes-or-more").expect("ikm");
+        let sk =
+            BbsSecretKey::from_ikm(b"solidus-credential-test-ikm-32-bytes-or-more").expect("ikm");
         sk.public_key().to_bytes()
     }
 
@@ -353,9 +353,9 @@ mod tests {
 
     #[test]
     fn build_credential_id_format() {
-        let issuer  = "did:solidus:testnet:issuer";
+        let issuer = "did:solidus:testnet:issuer";
         let subject = "did:solidus:testnet:subject";
-        let hash    = sample_hash();
+        let hash = sample_hash();
         let id = build_credential_id(issuer, subject, &hash, 42);
         assert!(
             id.starts_with("urn:solidus:credential:"),
@@ -365,9 +365,9 @@ mod tests {
 
     #[test]
     fn build_credential_id_deterministic() {
-        let issuer  = "did:solidus:testnet:issuer";
+        let issuer = "did:solidus:testnet:issuer";
         let subject = "did:solidus:testnet:subject";
-        let hash    = sample_hash();
+        let hash = sample_hash();
         let id1 = build_credential_id(issuer, subject, &hash, 42);
         let id2 = build_credential_id(issuer, subject, &hash, 42);
         assert_eq!(id1, id2);
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn build_credential_id_differs_by_input() {
-        let issuer   = "did:solidus:testnet:issuer";
+        let issuer = "did:solidus:testnet:issuer";
         let subject1 = "did:solidus:testnet:subject_a";
         let subject2 = "did:solidus:testnet:subject_b";
         let hash = sample_hash();
@@ -390,12 +390,12 @@ mod tests {
 
     #[test]
     fn credential_type_fees() {
-        assert_eq!(CredentialType::Email.issue_fee(),      1_000_000);
-        assert_eq!(CredentialType::Phone.issue_fee(),      2_000_000);
-        assert_eq!(CredentialType::KycL1.issue_fee(),    100_000_000);
-        assert_eq!(CredentialType::KycL2.issue_fee(),    500_000_000);
-        assert_eq!(CredentialType::KycL3.issue_fee(),  2_000_000_000);
-        assert_eq!(CredentialType::Age.issue_fee(),        5_000_000);
+        assert_eq!(CredentialType::Email.issue_fee(), 1_000_000);
+        assert_eq!(CredentialType::Phone.issue_fee(), 2_000_000);
+        assert_eq!(CredentialType::KycL1.issue_fee(), 100_000_000);
+        assert_eq!(CredentialType::KycL2.issue_fee(), 500_000_000);
+        assert_eq!(CredentialType::KycL3.issue_fee(), 2_000_000_000);
+        assert_eq!(CredentialType::Age.issue_fee(), 5_000_000);
         assert_eq!(CredentialType::Reputation.issue_fee(), 1_000_000);
     }
 
@@ -465,11 +465,8 @@ mod tests {
     #[test]
     fn revoke_credential_success() {
         let record = sample_record();
-        let result = execute_credential_revoke(
-            "did:solidus:testnet:issuer",
-            Some(&record),
-            2_000_000,
-        );
+        let result =
+            execute_credential_revoke("did:solidus:testnet:issuer", Some(&record), 2_000_000);
         let updated = result.expect("expected success");
         assert!(updated.revoked);
         assert_eq!(updated.revoked_ms, Some(2_000_000));
@@ -482,12 +479,8 @@ mod tests {
         record.revoked = true;
         record.revoked_ms = Some(1_500_000);
 
-        let err = execute_credential_revoke(
-            "did:solidus:testnet:issuer",
-            Some(&record),
-            2_000_000,
-        )
-        .expect_err("expected AlreadyRevoked");
+        let err = execute_credential_revoke("did:solidus:testnet:issuer", Some(&record), 2_000_000)
+            .expect_err("expected AlreadyRevoked");
         assert_eq!(err, CredentialError::AlreadyRevoked(record.id));
     }
 
@@ -505,12 +498,8 @@ mod tests {
 
     #[test]
     fn revoke_credential_not_found() {
-        let err = execute_credential_revoke(
-            "did:solidus:testnet:issuer",
-            None,
-            2_000_000,
-        )
-        .expect_err("expected NotFound");
+        let err = execute_credential_revoke("did:solidus:testnet:issuer", None, 2_000_000)
+            .expect_err("expected NotFound");
         assert!(matches!(err, CredentialError::NotFound(_)));
     }
 

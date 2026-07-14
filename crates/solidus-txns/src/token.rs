@@ -75,11 +75,7 @@ pub fn execute_transfer(
         })?;
 
     // Build the transfer event.
-    let events = vec![Event::Transfer {
-        from,
-        to,
-        amount,
-    }];
+    let events = vec![Event::Transfer { from, to, amount }];
 
     Ok(TransferResult {
         from,
@@ -107,9 +103,8 @@ mod tests {
     fn successful_transfer() {
         let from = addr(1);
         let to = addr(2);
-        let result =
-            execute_transfer(from, 1_000_000, to, 500_000, FEE_TRANSFER)
-                .expect("transfer should succeed");
+        let result = execute_transfer(from, 1_000_000, to, 500_000, FEE_TRANSFER)
+            .expect("transfer should succeed");
 
         assert_eq!(result.from, from);
         assert_eq!(result.to, to);
@@ -169,9 +164,8 @@ mod tests {
         let fee = FEE_TRANSFER;
 
         // Balance is exactly amount + fee — should succeed with zero remaining.
-        let result =
-            execute_transfer(from, amount + fee, to, amount, fee)
-                .expect("exact balance transfer should succeed");
+        let result = execute_transfer(from, amount + fee, to, amount, fee)
+            .expect("exact balance transfer should succeed");
 
         assert_eq!(result.amount, amount);
         assert_eq!(result.fee, fee);
@@ -183,8 +177,8 @@ mod tests {
         let to = addr(2);
 
         // amount + fee would overflow u64 → treat as insufficient balance.
-        let err = execute_transfer(from, u64::MAX, to, u64::MAX, 1)
-            .expect_err("should fail on overflow");
+        let err =
+            execute_transfer(from, u64::MAX, to, u64::MAX, 1).expect_err("should fail on overflow");
 
         assert_eq!(
             err,

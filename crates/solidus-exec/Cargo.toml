@@ -1,0 +1,31 @@
+[package]
+name = "solidus-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Solidus v2 two-lane executor: serial reference oracle, lane partition, delta/fee machinery"
+
+[dependencies]
+solidus-txns = { workspace = true }
+solidus-crypto = { workspace = true }
+solidus-state-tree = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+ed25519-dalek = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+# Legacy execution stack pulled in ONLY for the differential parity anchor
+# (reference executor vs live executor.rs). Never a production dependency.
+solidus-state = { workspace = true }
+tempfile = { workspace = true }
+rand = { workspace = true }
+criterion = { workspace = true }
+hex = { workspace = true }
+
+[[bench]]
+name = "executor"
+harness = false

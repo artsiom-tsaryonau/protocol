@@ -1,0 +1,25 @@
+[package]
+name = "solidus-state-tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Incremental 4-sub-tree sparse Merkle state tree for the Solidus v2 execution layer"
+
+[dependencies]
+solidus-crypto = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Legacy crate pulled in ONLY to differential-test root parity against the
+# live RocksDB-backed tree. Never a production dependency.
+solidus-state = { workspace = true }
+tempfile = { workspace = true }
+rand = { workspace = true }
+bincode = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "tree"
+harness = false

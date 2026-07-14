@@ -1,9 +1,17 @@
 use serde::{Deserialize, Serialize};
 use solidus_consensus::types::Block;
+use solidus_txns::compute::ComputeTier;
 use solidus_txns::credential::CredentialRecord;
-use solidus_txns::did::DidDocument;
+use solidus_txns::did::{DidDocument, RecoveryPolicy};
 use solidus_txns::staking::ValidatorInfo;
 use solidus_txns::types::{Event, Receipt, TxStatus};
+
+fn tier_str(tier: &ComputeTier) -> &'static str {
+    match tier {
+        ComputeTier::Trusted => "trusted",
+        ComputeTier::Attested => "attested",
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RpcBlock
@@ -86,11 +94,7 @@ impl RpcReceipt {
             TxStatus::Failed(reason) => format!("failed: {reason}"),
         };
 
-        let events: Vec<serde_json::Value> = receipt
-            .events
-            .iter()
-            .map(event_to_json)
-            .collect();
+        let events: Vec<serde_json::Value> = receipt.events.iter().map(event_to_json).collect();
 
         Self {
             tx_hash: hex::encode(receipt.tx_hash),
@@ -114,10 +118,33 @@ pub struct RpcDidDocument {
     pub controller: String,
     pub verification_method: Vec<serde_json::Value>,
     pub authentication: Vec<String>,
+    #[serde(default)]
+    pub assertion_method: Vec<String>,
+    #[serde(default)]
+    pub key_agreement: Vec<String>,
+    #[serde(default)]
+    pub capability_invocation: Vec<String>,
+    #[serde(default)]
+    pub capability_delegation: Vec<String>,
     pub service: Vec<serde_json::Value>,
     pub active: bool,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// W3C DID Resolution `versionId`: hex-encoded BLAKE3 hash of the
+    /// stored document. `#[serde(default)]` means pre-2026-05-09 records
+    /// surface as `""`; SDK callers should treat empty string as
+    /// "metadata unavailable".
+    #[serde(default)]
+    pub version_id: String,
+    /// On-chain social-recovery policy, if the owner has set one. `None`
+    /// until configured; recovery is impossible without it. `#[serde(default)]`
+    /// keeps legacy records (which omit this field) deserializing cleanly.
+    #[serde(default)]
+    pub recovery_policy: Option<RecoveryPolicy>,
+    /// Monotonic per-DID recovery counter, bumped on each successful recovery.
+    /// Guardian approvals are bound to this value for replay protection.
+    #[serde(default)]
+    pub recovery_nonce: u64,
 }
 
 impl RpcDidDocument {
@@ -140,6 +167,10 @@ impl RpcDidDocument {
                 })
                 .collect(),
             authentication: doc.authentication.clone(),
+            assertion_method: doc.assertion_method.clone(),
+            key_agreement: doc.key_agreement.clone(),
+            capability_invocation: doc.capability_invocation.clone(),
+            capability_delegation: doc.capability_delegation.clone(),
             service: doc
                 .service
                 .iter()
@@ -154,6 +185,9 @@ impl RpcDidDocument {
             active: doc.active,
             created_ms: doc.created_ms,
             updated_ms: doc.updated_ms,
+            version_id: doc.version_id.clone(),
+            recovery_policy: doc.recovery_policy.clone(),
+            recovery_nonce: doc.recovery_nonce,
         }
     }
 }
@@ -278,7 +312,17 @@ fn event_to_json(event: &Event) -> serde_json::Value {
                 "did": did,
             })
         }
-        Event::CredentialIssued { credential_id, issuer, subject } => {
+        Event::DidRecovered { did } => {
+            serde_json::json!({
+                "type": "DidRecovered",
+                "did": did,
+            })
+        }
+        Event::CredentialIssued {
+            credential_id,
+            issuer,
+            subject,
+        } => {
             serde_json::json!({
                 "type": "CredentialIssued",
                 "credentialId": credential_id,
@@ -292,7 +336,11 @@ fn event_to_json(event: &Event) -> serde_json::Value {
                 "credentialId": credential_id,
             })
         }
-        Event::Staked { validator, amount, total_stake } => {
+        Event::Staked {
+            validator,
+            amount,
+            total_stake,
+        } => {
             serde_json::json!({
                 "type": "Staked",
                 "validator": validator.to_base58(),
@@ -300,12 +348,63 @@ fn event_to_json(event: &Event) -> serde_json::Value {
                 "totalStake": total_stake,
             })
         }
-        Event::Unstaked { validator, amount, remaining_stake } => {
+        Event::Unstaked {
+            validator,
+            amount,
+            remaining_stake,
+        } => {
             serde_json::json!({
                 "type": "Unstaked",
                 "validator": validator.to_base58(),
                 "amount": amount,
                 "remainingStake": remaining_stake,
+            })
+        }
+        Event::ComputeAdmitted { operator, tier } => {
+            serde_json::json!({
+                "type": "ComputeAdmitted",
+                "operator": operator.to_base58(),
+                "tier": tier_str(tier),
+            })
+        }
+        Event::ComputeRemoved { operator } => {
+            serde_json::json!({
+                "type": "ComputeRemoved",
+                "operator": operator.to_base58(),
+            })
+        }
+        Event::ComputeRegistered {
+            operator,
+            jurisdiction,
+            tier,
+        } => {
+            serde_json::json!({
+                "type": "ComputeRegistered",
+                "operator": operator.to_base58(),
+                "jurisdiction": jurisdiction,
+                "tier": tier_str(tier),
+            })
+        }
+        Event::ComputeAnchored {
+            merkle_root,
+            batch_count,
+        } => {
+            serde_json::json!({
+                "type": "ComputeAnchored",
+                "merkleRoot": hex::encode(merkle_root),
+                "batchCount": batch_count,
+            })
+        }
+        Event::ComputeSlashed {
+            operator,
+            severe,
+            reputation,
+        } => {
+            serde_json::json!({
+                "type": "ComputeSlashed",
+                "operator": operator.to_base58(),
+                "severe": severe,
+                "reputation": reputation,
             })
         }
     }
@@ -381,6 +480,18 @@ mod tests {
         let rpc = RpcReceipt::from_receipt(&receipt);
         assert_eq!(rpc.status, "failed: insufficient balance");
     }
+
+    #[test]
+    fn node_info_serialization_roundtrip() {
+        let info = NodeInfo {
+            version: "0.1.0".to_string(),
+            uptime_seconds: 123,
+            rss_bytes: 4096,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: NodeInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, back);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -413,4 +524,62 @@ pub struct RpcCredentialProofResult {
     pub revoked: bool,
     /// The credential record on-chain (or `null` if not found).
     pub credential: Option<RpcCredentialRecord>,
+}
+
+// ---------------------------------------------------------------------------
+// Chain info
+// ---------------------------------------------------------------------------
+
+/// Native token metadata as surfaced over JSON-RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcNativeToken {
+    /// Display symbol — e.g. `"SLDS"`. Uppercase, no `$` prefix.
+    pub symbol: String,
+    /// Display name — e.g. `"Solidus"`.
+    pub name: String,
+    /// Decimal precision (`8` → `1 SLDS = 10^8` base units).
+    pub decimals: u8,
+}
+
+/// Result returned by `solidus_chainInfo`: a self-description of the chain
+/// for wallets, explorers, indexers, and listing aggregators (CoinMarketCap
+/// and CoinGecko moderators included).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcChainInfo {
+    /// Unique chain identifier from genesis.
+    pub chain_id: String,
+    /// Native token metadata.
+    pub native_token: RpcNativeToken,
+    /// Hex-encoded hash of the genesis block (height 0). Empty string when
+    /// no genesis block is present in the store.
+    pub genesis_hash: String,
+    /// Height of the latest committed block.
+    pub latest_block: u64,
+    /// Node software version (`CARGO_PKG_VERSION`).
+    pub version: String,
+}
+
+/// Process-level node observability surfaced by `solidus_nodeInfo`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeInfo {
+    /// Node software version (same value as `RpcChainInfo.version`).
+    pub version: String,
+    /// Seconds since the node's RPC service started.
+    pub uptime_seconds: u64,
+    /// Resident set size of the node process in bytes. `0` when unavailable
+    /// (non-Linux hosts, or `/proc` not readable).
+    pub rss_bytes: u64,
+}
+
+/// Head of the contiguous canonical ledger surfaced by `solidus_canonHead`.
+///
+/// `seq` is the authoritative chain position (the index into `CF_CANON`),
+/// distinct from `BlockHeader::height` which can be lossy under fast leader
+/// rotation. `hash` is the hex-encoded block hash at that seq.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcCanonHead {
+    /// Contiguous canonical sequence number (`0` for genesis, monotonic).
+    pub seq: u64,
+    /// Hex-encoded hash of the block at this seq.
+    pub hash: String,
 }

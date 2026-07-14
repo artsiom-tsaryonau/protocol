@@ -1,0 +1,24 @@
+[package]
+name = "solidus-rpc2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Solidus v2 JSON-RPC edge: submit + query over committed state. Binary internal, JSON only at the boundary."
+
+[dependencies]
+solidus-exec = { workspace = true }
+solidus-store2 = { workspace = true }
+solidus-txns = { workspace = true }
+solidus-crypto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+jsonrpsee = { workspace = true, features = ["server", "client"] }
+tokio = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+tempfile = { workspace = true }

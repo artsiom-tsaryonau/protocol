@@ -9,6 +9,10 @@ solidus-txns.workspace = true
 solidus-state.workspace = true
 solidus-consensus.workspace = true
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
+# tower 0.4 to match jsonrpsee 0.24's set_http_middleware(ServiceBuilder) signature.
+tower = "0.4"
+tower-http = { version = "0.6", features = ["cors"] }
+http = "1"
 serde.workspace = true
 serde_json.workspace = true
 rocksdb.workspace = true

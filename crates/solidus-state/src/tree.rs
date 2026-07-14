@@ -60,6 +60,32 @@ pub fn flip_bit(data: &mut [u8; 32], pos: usize) {
     data[byte_index] ^= 1 << bit_index;
 }
 
+/// Zero bits 0..pos (positions 0 through pos-1, inclusive) in `data`.
+///
+/// `pos = 0` is a no-op. `pos = 256` zeros the entire hash. Used to
+/// canonicalize internal-node storage paths: at SMT walk level L, the
+/// node is uniquely identified by bits L..255 of the leaf hash (bits
+/// 0..L-1 have been "consumed" by the walk up to this node, so two
+/// leaves that agree on bits L..255 share this internal node).
+pub fn zero_bits_below(data: &mut [u8; 32], pos: usize) {
+    if pos == 0 {
+        return;
+    }
+    let full_bytes = (pos / 8).min(32);
+    let partial_bits = pos % 8;
+    for byte in &mut data[..full_bytes] {
+        *byte = 0;
+    }
+    if partial_bits > 0 && full_bytes < 32 {
+        // Zero the TOP `partial_bits` bits of the next byte (positions
+        // full_bytes*8 .. full_bytes*8 + partial_bits - 1 are the high
+        // bits of the byte under MSB-first numbering). Keep the low
+        // (8 - partial_bits) bits.
+        let mask: u8 = (1u16 << (8 - partial_bits)) as u8 - 1;
+        data[full_bytes] &= mask;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SparseMerkleTree
 // ---------------------------------------------------------------------------
@@ -114,11 +140,30 @@ impl SparseMerkleTree {
     /// 4. Walk from level 0 (leaf) to level 255 (root), updating internal
     ///    nodes and recomputing parent hashes.
     /// 5. The final hash at the top is the new root.
+    ///
+    /// # Canonical internal-node identifiers (the bug-fix this commit makes
+    /// load-bearing)
+    ///
+    /// An internal node at walk-level L is identified by bits L..255 of the
+    /// leaf hash (bits 0..L-1 are "consumed" walking up to this node, so
+    /// they don't distinguish subtrees at level L). Storing under the full
+    /// key_hash — as this code previously did — meant every leaf got its
+    /// OWN chain of 256 "internal nodes" rather than sharing the upper
+    /// branches with other leaves. Result: `self.root = current_hash` at
+    /// loop-end reflected ONLY the last-inserted leaf's chain through empty
+    /// siblings; `compute_state_root`'s root depended only on whichever
+    /// account RocksDB happened to iterate last. Witnessed live as
+    /// "subsequent Transfers don't change state_root" (MEMORY 2026-05-19).
+    ///
+    /// Fix: canonicalize the storage path per level via
+    /// [`zero_bits_below`] so two leaves that agree on bits L..255 actually
+    /// share the level-L internal node — making this a real shared-state
+    /// sparse Merkle tree whose root reflects EVERY leaf's current value.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<[u8; 32], StoreError> {
         let key_hash = blake3_hash(key);
         let value_hash = blake3_hash(value);
 
-        // Store the raw leaf value
+        // Store the raw leaf value (full key_hash — leaves are unique).
         let leaf_key = self.leaf_storage_key(&key_hash);
         self.store.put(CF_MERKLE, &leaf_key, value)?;
 
@@ -128,19 +173,28 @@ impl SparseMerkleTree {
         leaf_data[32..].copy_from_slice(&value_hash);
         let mut current_hash = blake3_hash(&leaf_data);
 
-        // Walk from level 0 to 255, updating internal nodes
+        // Walk from level 0 to 255, updating internal nodes.
         for level in 0..256u16 {
             let bit = get_bit(&key_hash, level as usize);
 
-            // Look up the sibling hash
-            let mut sibling_path = key_hash;
+            // Canonical path identifier for the node we're WRITING at this
+            // level: bits 0..L-1 zeroed (consumed by the walk so far).
+            let mut current_path = key_hash;
+            zero_bits_below(&mut current_path, level as usize);
+
+            // Sibling shares the same parent → same bits L+1..255 as
+            // current_path AND bits 0..L-1 also zero. Differs only in
+            // bit L. So: flip bit L of current_path.
+            let mut sibling_path = current_path;
             flip_bit(&mut sibling_path, level as usize);
+
             let sibling_hash = self
                 .get_node(level, &sibling_path)?
                 .unwrap_or(EMPTY_HASHES[level as usize]);
 
-            // Store this node
-            self.put_node(level, &key_hash, &current_hash)?;
+            // Store this node at its CANONICAL path so the sibling lookup
+            // above can find it when the other leaf inserts.
+            self.put_node(level, &current_path, &current_hash)?;
 
             // Compute parent: left || right
             let (left, right) = if bit == 0 {
@@ -211,12 +265,7 @@ impl SparseMerkleTree {
     }
 
     /// Store an internal node hash.
-    fn put_node(
-        &self,
-        level: u16,
-        path: &[u8; 32],
-        hash: &[u8; 32],
-    ) -> Result<(), StoreError> {
+    fn put_node(&self, level: u16, path: &[u8; 32], hash: &[u8; 32]) -> Result<(), StoreError> {
         let key = self.node_storage_key(level, path);
         self.store.put(CF_MERKLE, &key, hash)
     }
@@ -434,5 +483,132 @@ mod tests {
         // Flip bit 8 (MSB of byte 1): 0 -> 1
         flip_bit(&mut data, 8);
         assert_eq!(data[1], 0x80);
+    }
+
+    #[test]
+    fn zero_bits_below_works() {
+        // pos = 0 is a no-op.
+        let mut a = [0xFFu8; 32];
+        zero_bits_below(&mut a, 0);
+        assert_eq!(a, [0xFFu8; 32]);
+
+        // pos = 8 zeros exactly byte 0.
+        let mut b = [0xFFu8; 32];
+        zero_bits_below(&mut b, 8);
+        assert_eq!(b[0], 0x00);
+        assert_eq!(b[1], 0xFF);
+
+        // pos = 5 zeros the top 5 bits of byte 0 (keeps low 3 bits).
+        let mut c = [0xFFu8; 32];
+        zero_bits_below(&mut c, 5);
+        assert_eq!(c[0], 0b00000111);
+        assert_eq!(c[1], 0xFF);
+
+        // pos = 13 zeros byte 0 + top 5 bits of byte 1.
+        let mut d = [0xFFu8; 32];
+        zero_bits_below(&mut d, 13);
+        assert_eq!(d[0], 0x00);
+        assert_eq!(d[1], 0b00000111);
+        assert_eq!(d[2], 0xFF);
+
+        // pos = 256 zeros the whole hash.
+        let mut e = [0xFFu8; 32];
+        zero_bits_below(&mut e, 256);
+        assert_eq!(e, [0u8; 32]);
+    }
+
+    // ------------------------------------------------------------------
+    // Real-SMT property tests (these FAIL under the pre-fix tree.rs and
+    // PASS under the canonical-path implementation). They guard against
+    // regression to the "each leaf has its own isolated chain" bug.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn root_depends_on_every_inserted_leaf_not_just_last() {
+        // Real-SMT invariant: changing ANY leaf's value MUST change the
+        // root, regardless of insertion order. Under the bug, the root
+        // depended only on the last-inserted leaf, so this assertion
+        // would fail (both roots equal the chain of `bob`'s leaf hash
+        // through empty siblings).
+        let s1 = open_tmp_store();
+        let mut t1 = SparseMerkleTree::new(Arc::clone(&s1), TreeId::Accounts);
+        t1.insert(b"alice", b"100").unwrap();
+        t1.insert(b"bob", b"200").unwrap();
+        let r1 = t1.root();
+
+        let s2 = open_tmp_store();
+        let mut t2 = SparseMerkleTree::new(Arc::clone(&s2), TreeId::Accounts);
+        t2.insert(b"alice", b"999").unwrap();
+        t2.insert(b"bob", b"200").unwrap();
+        let r2 = t2.root();
+
+        assert_ne!(
+            r1, r2,
+            "SMT root must change when alice's value changes, even though bob \
+             was the last-iterated insert (pre-fix bug: roots equal because \
+             only bob's chain through empties survived in self.root)"
+        );
+    }
+
+    #[test]
+    fn root_is_independent_of_insertion_order() {
+        // Real-SMT invariant: insert(A, V_A), insert(B, V_B) produces the
+        // same root as insert(B, V_B), insert(A, V_A). Under the bug,
+        // self.root reflected only the last-inserted leaf, so the two
+        // orders produced DIFFERENT roots (chain-of-bob vs chain-of-alice).
+        let s1 = open_tmp_store();
+        let mut t1 = SparseMerkleTree::new(Arc::clone(&s1), TreeId::Accounts);
+        t1.insert(b"alice", b"100").unwrap();
+        t1.insert(b"bob", b"200").unwrap();
+
+        let s2 = open_tmp_store();
+        let mut t2 = SparseMerkleTree::new(Arc::clone(&s2), TreeId::Accounts);
+        t2.insert(b"bob", b"200").unwrap();
+        t2.insert(b"alice", b"100").unwrap();
+
+        assert_eq!(
+            t1.root(),
+            t2.root(),
+            "SMT root must be insertion-order-independent (pre-fix bug: order \
+             changed which leaf's chain ended up in self.root)"
+        );
+    }
+
+    #[test]
+    fn root_changes_when_middle_account_changes() {
+        // The original on-chain symptom: with N accounts in iteration order
+        // [a, b, c, d], changing b's value DID NOT change the state root
+        // (only changing d's value did). Real SMT: changing any account
+        // changes the root.
+        let s1 = open_tmp_store();
+        let mut t1 = SparseMerkleTree::new(Arc::clone(&s1), TreeId::Accounts);
+        for (k, v) in [
+            (b"acc-a".as_ref(), b"1".as_ref()),
+            (b"acc-b", b"2"),
+            (b"acc-c", b"3"),
+            (b"acc-d", b"4"),
+        ] {
+            t1.insert(k, v).unwrap();
+        }
+        let r1 = t1.root();
+
+        let s2 = open_tmp_store();
+        let mut t2 = SparseMerkleTree::new(Arc::clone(&s2), TreeId::Accounts);
+        for (k, v) in [
+            (b"acc-a".as_ref(), b"1".as_ref()),
+            (b"acc-b", b"22"), // ← only middle account differs
+            (b"acc-c", b"3"),
+            (b"acc-d", b"4"),
+        ] {
+            t2.insert(k, v).unwrap();
+        }
+        let r2 = t2.root();
+
+        assert_ne!(
+            r1, r2,
+            "Changing a middle-of-iteration account's value MUST change the \
+             state root (pre-fix bug: only changes to the last-iterated \
+             account propagated)"
+        );
     }
 }

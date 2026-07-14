@@ -37,7 +37,13 @@ impl BlockHeader {
     ///
     /// `BLAKE3(serde_json(self))`
     pub fn hash(&self) -> [u8; 32] {
-        let bytes = serde_json::to_vec(self).expect("header serialization");
+        // Infallible: BlockHeader is a fixed-shape POD struct (u64s,
+        // [u8;32]s, Address newtype, u32). No serde impl on its fields
+        // can return an error. The `expect` is documenting an invariant
+        // and acts as a tripwire if the struct ever widens to include a
+        // fallible-to-serialize type.
+        #[allow(clippy::expect_used)]
+        let bytes = serde_json::to_vec(self).expect("header serialization (POD)");
         blake3_hash(&bytes)
     }
 }
@@ -141,9 +147,34 @@ impl QuorumCertificate {
         self.signers.count_ones()
     }
 
+    /// Verify this QC: the aggregate signature is valid over `block_hash` for the
+    /// pubkeys of the signers indicated by `signers`, and at least `quorum`
+    /// validators signed. `validators` is the committee, indexed by signer bit.
+    pub fn verify(&self, validators: &[ValidatorIdentity], quorum: usize) -> bool {
+        if self.signer_count() < quorum {
+            return false;
+        }
+        let mut signer_pks: Vec<&BlsPublicKey> = Vec::with_capacity(self.signer_count());
+        for i in self.signers.iter_ones() {
+            match validators.get(i) {
+                Some(v) => signer_pks.push(&v.bls_pubkey),
+                None => return false, // signer index out of range
+            }
+        }
+        if signer_pks.is_empty() {
+            return false;
+        }
+        self.aggregate_sig
+            .fast_aggregate_verify(&signer_pks, &self.block_hash)
+    }
+
     /// Compute the content-address of this QC.
     pub fn hash(&self) -> [u8; 32] {
-        let bytes = serde_json::to_vec(self).expect("QC serializable");
+        // Infallible: QuorumCertificate's serde shape (block_hash + round +
+        // aggregate_sig bytes + signers bitvec) is POD. Same tripwire
+        // rationale as `BlockHeader::hash`.
+        #[allow(clippy::expect_used)]
+        let bytes = serde_json::to_vec(self).expect("QC serializable (POD)");
         blake3_hash(&bytes)
     }
 }
@@ -189,6 +220,9 @@ pub struct TimeoutCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solidus_crypto::bls::BlsSecretKey;
+    use solidus_crypto::ed25519::generate_signing_key;
+    use solidus_crypto::keys::Address;
 
     #[test]
     fn empty_transactions_root() {
@@ -264,6 +298,72 @@ mod tests {
         let h1 = qc.hash();
         let h2 = qc.hash();
         assert_eq!(h1, h2);
+    }
+
+    fn validators_and_keys(n: usize) -> (Vec<ValidatorIdentity>, Vec<BlsSecretKey>) {
+        let mut vals = Vec::new();
+        let mut bls = Vec::new();
+        for _ in 0..n {
+            let ed = generate_signing_key();
+            let bsk = BlsSecretKey::generate();
+            vals.push(ValidatorIdentity {
+                address: Address::from_public_key(&ed.verifying_key()),
+                ed25519_pubkey: ed.verifying_key().to_bytes(),
+                bls_pubkey: bsk.public_key(),
+            });
+            bls.push(bsk);
+        }
+        (vals, bls)
+    }
+
+    fn qc_over(
+        block_hash: [u8; 32],
+        round: u64,
+        signers_idx: &[usize],
+        bls: &[BlsSecretKey],
+        n: usize,
+    ) -> QuorumCertificate {
+        let sigs: Vec<_> = signers_idx
+            .iter()
+            .map(|&i| bls[i].sign(&block_hash))
+            .collect();
+        let refs: Vec<&BlsSignature> = sigs.iter().collect();
+        let aggregate_sig = BlsSignature::aggregate(&refs).expect("aggregate");
+        let mut signers = bitvec![u8, Msb0; 0; n];
+        for &i in signers_idx {
+            signers.set(i, true);
+        }
+        QuorumCertificate {
+            block_hash,
+            round,
+            aggregate_sig,
+            signers,
+        }
+    }
+
+    #[test]
+    fn qc_verify_accepts_quorum_signed() {
+        let (vals, bls) = validators_and_keys(4);
+        let qc = qc_over([7u8; 32], 0, &[0, 1, 2], &bls, 4);
+        assert!(qc.verify(&vals, 3), "valid 3-of-4 QC must verify");
+    }
+
+    #[test]
+    fn qc_verify_rejects_below_quorum() {
+        let (vals, bls) = validators_and_keys(4);
+        let qc = qc_over([7u8; 32], 0, &[0, 1], &bls, 4);
+        assert!(!qc.verify(&vals, 3), "2 signers < quorum 3 must fail");
+    }
+
+    #[test]
+    fn qc_verify_rejects_wrong_block_hash() {
+        let (vals, bls) = validators_and_keys(4);
+        let mut qc = qc_over([7u8; 32], 0, &[0, 1, 2], &bls, 4);
+        qc.block_hash = [9u8; 32];
+        assert!(
+            !qc.verify(&vals, 3),
+            "aggregate over a different hash must fail"
+        );
     }
 
     #[test]

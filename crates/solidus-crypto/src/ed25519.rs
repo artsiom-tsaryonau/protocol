@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// Sign a message with the given Ed25519 signing key.
 /// Returns a 64-byte signature.
@@ -8,9 +8,17 @@ pub fn sign(key: &SigningKey, message: &[u8]) -> [u8; 64] {
 
 /// Verify an Ed25519 signature against a message and verifying key.
 /// Returns `true` if the signature is valid.
+///
+/// Uses `verify_strict` so identity / small-order public keys and
+/// malleable signatures are rejected — non-strict verify can accept
+/// the all-zeros pubkey + all-zeros sig pair (the vacuous identity
+/// equation), which is a real chain-level bug if an attacker submits
+/// a tx with `sender_pubkey = [0; 32]`. Strict verification closes
+/// this and matches what every production ed25519 deployment should
+/// use.
 pub fn verify(key: &VerifyingKey, message: &[u8], signature: &[u8; 64]) -> bool {
     let sig = Signature::from_bytes(signature);
-    key.verify(message, &sig).is_ok()
+    key.verify_strict(message, &sig).is_ok()
 }
 
 /// Generate a new random Ed25519 signing key.

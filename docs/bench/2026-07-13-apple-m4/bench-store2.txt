@@ -1,0 +1,24 @@
+   Compiling solidus-store2 v0.1.0 (/Users/fatih/Documents/Works/solidus.network/projects/protocol/apps/consensus/crates/solidus-store2)
+    Finished `bench` profile [optimized] target(s) in 1.93s
+     Running benches/store2.rs (target/release/deps/store2-d71f254616e489cb)
+Gnuplot not found, using plotters backend
+Benchmarking persist_block_Testnet/50k_leaves_25k_receipts
+Benchmarking persist_block_Testnet/50k_leaves_25k_receipts: Warming up for 3.0000 s
+Benchmarking persist_block_Testnet/50k_leaves_25k_receipts: Collecting 10 samples in estimated 5.3645 s (220 iterations)
+Benchmarking persist_block_Testnet/50k_leaves_25k_receipts: Analyzing
+persist_block_Testnet/50k_leaves_25k_receipts
+                        time:   [19.863 ms 20.128 ms 20.567 ms]
+                        thrpt:  [2.4312 Melem/s 2.4841 Melem/s 2.5173 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+
+Benchmarking persist_block_Mainnet/50k_leaves_25k_receipts
+Benchmarking persist_block_Mainnet/50k_leaves_25k_receipts: Warming up for 3.0000 s
+Benchmarking persist_block_Mainnet/50k_leaves_25k_receipts: Collecting 10 samples in estimated 5.3185 s (220 iterations)
+Benchmarking persist_block_Mainnet/50k_leaves_25k_receipts: Analyzing
+persist_block_Mainnet/50k_leaves_25k_receipts
+                        time:   [19.762 ms 19.939 ms 20.131 ms]
+                        thrpt:  [2.4838 Melem/s 2.5077 Melem/s 2.5301 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+

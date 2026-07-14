@@ -62,7 +62,17 @@ impl Pacemaker {
 
     /// Called when round timer expires.
     pub fn on_timeout(&self) -> PacemakerEvent {
-        PacemakerEvent::Timeout { round: self.current_round }
+        PacemakerEvent::Timeout {
+            round: self.current_round,
+        }
+    }
+
+    /// Push the deadline forward by `timeout_duration` without changing the
+    /// round. Call after broadcasting a timeout vote so the consensus loop
+    /// does not busy-spin on an already-expired deadline while waiting for
+    /// either a TC (which advances the round) or a late proposal/QC.
+    pub fn bump_deadline_after_timeout(&mut self) {
+        self.deadline = Instant::now() + self.timeout_duration;
     }
 
     /// Fast-forward to a higher round if we see a QC/TC for it.
@@ -146,5 +156,15 @@ mod tests {
         let event = pm.try_fast_forward(5);
         assert_eq!(event, None);
         assert_eq!(pm.current_round(), 5);
+    }
+
+    #[test]
+    fn bump_deadline_after_timeout_pushes_forward_without_advancing_round() {
+        let mut pm = Pacemaker::new(0);
+        pm.deadline = Instant::now() - Duration::from_millis(50);
+        let before = Instant::now();
+        pm.bump_deadline_after_timeout();
+        assert!(pm.deadline() > before);
+        assert_eq!(pm.current_round(), 0);
     }
 }

@@ -6,6 +6,17 @@ use std::fmt;
 /// backend; the libp2p backend will map `PeerId` ↔ `libp2p::PeerId`).
 pub type PeerId = usize;
 
+/// Opaque network-level identity of a peer, used by the PeerId-addressed sync
+/// path (C2 full-node mode).
+///
+/// A full node has no validator index, so it cannot use the index-based
+/// [`PeerId`] / `peer_map` send path. It addresses discovered peers by their
+/// libp2p identity instead. This newtype wraps `libp2p::PeerId` so the
+/// transport trait stays backend-agnostic: the channel backend treats
+/// `SourcePeer` as opaque and its sync methods default to no-ops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourcePeer(pub libp2p::PeerId);
+
 // ---------------------------------------------------------------------------
 // TransportError
 // ---------------------------------------------------------------------------
@@ -60,4 +71,42 @@ pub trait ConsensusTransport: Send + Sync + 'static {
     /// queued.  Used by the consensus loop to drain buffered messages before
     /// re-entering the pacemaker timeout.
     fn try_recv(&mut self) -> Option<(PeerId, ConsensusMessage)>;
+
+    // -----------------------------------------------------------------------
+    // PeerId-addressed sync path (C2 full-node mode) — additive.
+    //
+    // The validator path above (index `send`/`recv`/`peer_map`) is unchanged.
+    // These methods let an index-less full node send to, and a validator reply
+    // to, a peer identified only by its network-level [`SourcePeer`]. Default
+    // implementations make this a no-op for backends without PeerIds (the
+    // in-process channel backend), so existing implementors need no changes.
+    // -----------------------------------------------------------------------
+
+    /// Send `msg` to a peer identified by its network-level [`SourcePeer`],
+    /// bypassing the validator index `peer_map`. Used by the full-node sync
+    /// path and by responders replying to an index-less requester.
+    ///
+    /// The default errors: backends without PeerIds (the channel backend)
+    /// cannot address peers this way and are never asked to.
+    async fn send_to_peer_id(
+        &self,
+        _peer: SourcePeer,
+        _msg: ConsensusMessage,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::Closed)
+    }
+
+    /// Like [`recv`](Self::recv) but also surfaces the inbound message's
+    /// network-level source ([`SourcePeer`]) when one is available, so a
+    /// responder can reply to an index-less requester via
+    /// [`send_to_peer_id`](Self::send_to_peer_id).
+    ///
+    /// The default delegates to [`recv`](Self::recv) and reports no source —
+    /// correct for backends without PeerIds.
+    async fn recv_with_source(
+        &mut self,
+    ) -> Result<(PeerId, Option<SourcePeer>, ConsensusMessage), TransportError> {
+        let (peer, msg) = self.recv().await?;
+        Ok((peer, None, msg))
+    }
 }

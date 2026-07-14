@@ -1,0 +1,19 @@
+[package]
+name = "solidus-mempool-dag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Narwhal-style DAG mempool for Solidus v2: worker/primary split, BLS availability certificates, digest-ordered blocks"
+
+[dependencies]
+solidus-txns = { workspace = true }
+solidus-crypto = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }

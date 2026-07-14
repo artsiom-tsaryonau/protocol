@@ -1,3 +1,4 @@
+pub mod compute;
 pub mod credential;
 pub mod did;
 pub mod staking;

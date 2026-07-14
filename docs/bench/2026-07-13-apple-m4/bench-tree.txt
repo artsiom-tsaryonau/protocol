@@ -1,0 +1,22 @@
+   Compiling solidus-state-tree v0.1.0 (/Users/fatih/Documents/Works/solidus.network/projects/protocol/apps/consensus/crates/solidus-state-tree)
+    Finished `bench` profile [optimized] target(s) in 0.90s
+     Running benches/tree.rs (target/release/deps/tree-81517c969628881a)
+Gnuplot not found, using plotters backend
+Benchmarking root_apply_scaling/2k_delta_over_10000_leaf_state
+Benchmarking root_apply_scaling/2k_delta_over_10000_leaf_state: Warming up for 3.0000 s
+Benchmarking root_apply_scaling/2k_delta_over_10000_leaf_state: Collecting 10 samples in estimated 9.6926 s (110 iterations)
+Benchmarking root_apply_scaling/2k_delta_over_10000_leaf_state: Analyzing
+root_apply_scaling/2k_delta_over_10000_leaf_state
+                        time:   [75.284 ms 79.006 ms 81.813 ms]
+                        thrpt:  [24.446 Kelem/s 25.315 Kelem/s 26.566 Kelem/s]
+
+Benchmarking root_apply_scaling/2k_delta_over_100000_leaf_state
+Benchmarking root_apply_scaling/2k_delta_over_100000_leaf_state: Warming up for 3.0000 s
+Benchmarking root_apply_scaling/2k_delta_over_100000_leaf_state: Collecting 10 samples in estimated 8.7794 s (20 iterations)
+Benchmarking root_apply_scaling/2k_delta_over_100000_leaf_state: Analyzing
+root_apply_scaling/2k_delta_over_100000_leaf_state
+                        time:   [147.83 ms 150.08 ms 152.96 ms]
+                        thrpt:  [13.075 Kelem/s 13.326 Kelem/s 13.529 Kelem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+

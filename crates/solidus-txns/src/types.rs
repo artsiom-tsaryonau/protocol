@@ -4,8 +4,9 @@ use solidus_crypto::ed25519;
 use solidus_crypto::hash::blake3_hash;
 use solidus_crypto::keys::Address;
 
+use crate::compute::ComputeTier;
 use crate::credential::CredentialType;
-use crate::did::{DidPatch, Service};
+use crate::did::{DidPatch, GuardianApproval, Service};
 
 // ---------------------------------------------------------------------------
 // Serde helpers for large byte arrays ([u8; 64]) that serde doesn't cover
@@ -27,9 +28,7 @@ mod serde_bytes_64 {
     {
         let v: Vec<u8> = Deserialize::deserialize(deserializer)?;
         v.try_into()
-            .map_err(|v: Vec<u8>| {
-                serde::de::Error::invalid_length(v.len(), &"64 bytes")
-            })
+            .map_err(|v: Vec<u8>| serde::de::Error::invalid_length(v.len(), &"64 bytes"))
     }
 }
 
@@ -49,32 +48,34 @@ mod serde_bytes_96 {
     {
         let v: Vec<u8> = Deserialize::deserialize(deserializer)?;
         v.try_into()
-            .map_err(|v: Vec<u8>| {
-                serde::de::Error::invalid_length(v.len(), &"96 bytes")
-            })
+            .map_err(|v: Vec<u8>| serde::de::Error::invalid_length(v.len(), &"96 bytes"))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Fee constants (in smallest units; 1 SOLID = 10^8)
+// Fee constants (in smallest units; 1 SLDS = 10^8)
 // ---------------------------------------------------------------------------
 
-/// 0.0001 SOLID — fee for a value transfer.
+/// 0.0001 SLDS — fee for a value transfer.
 pub const FEE_TRANSFER: u64 = 10_000;
-/// 0.001 SOLID — fee for creating a DID document.
+/// 0.001 SLDS — fee for creating a DID document.
 pub const FEE_DID_CREATE: u64 = 100_000;
-/// 0.0001 SOLID — fee for updating a DID document.
+/// 0.0001 SLDS — fee for updating a DID document.
 pub const FEE_DID_UPDATE: u64 = 10_000;
-/// 0.0001 SOLID — fee for deactivating a DID document.
+/// 0.0001 SLDS — fee for deactivating a DID document.
 pub const FEE_DID_DEACTIVATE: u64 = 10_000;
-/// 0.0001 SOLID — fee for revoking a credential.
+/// 0.0001 SLDS — fee for revoking a credential.
 pub const FEE_CREDENTIAL_REVOKE: u64 = 10_000;
-/// 0.0001 SOLID — fee for staking.
+/// 0.0001 SLDS — fee for staking.
 pub const FEE_STAKE: u64 = 10_000;
-/// 0.0001 SOLID — fee for unstaking.
+/// 0.0001 SLDS — fee for unstaking.
 pub const FEE_UNSTAKE: u64 = 10_000;
-/// 1 SOLID expressed in the smallest unit.
-pub const ONE_SOLID: u64 = 100_000_000;
+/// 0.001 SLDS — fee for a guardian-authorized recovery (multi-sig verify).
+pub const FEE_DID_RECOVER: u64 = 100_000;
+/// Fee for a compute-network governance/registration transaction (§6.5).
+pub const FEE_COMPUTE: u64 = 10_000;
+/// 1 SLDS expressed in the smallest unit.
+pub const ONE_SLDS: u64 = 100_000_000;
 
 // ---------------------------------------------------------------------------
 // TxPayload
@@ -140,6 +141,43 @@ pub enum TxPayload {
     Stake { amount: u64 },
     /// Begin unbonding `amount` from the sender's staked balance.
     Unstake { amount: u64 },
+    /// Rotate a DID's key via k-of-n guardian approval (social recovery).
+    /// The envelope MUST be signed by `new_public_key` (the recovered key).
+    DidRecover {
+        /// The subject DID being recovered.
+        did: String,
+        /// The new 32-byte Ed25519 key to install as sole authentication.
+        new_public_key: [u8; 32],
+        /// Guardian authorizations (≥ policy threshold valid+distinct required).
+        approvals: Vec<GuardianApproval>,
+    },
+    /// GOVERNANCE (active validator): admit an operator to the compute allow-list
+    /// (Rebuild #5 §6.2.4 / BD-2).
+    ComputeAdmit {
+        operator: Address,
+        tier: ComputeTier,
+    },
+    /// GOVERNANCE: remove an operator from the compute network (allow-list + node).
+    ComputeRemove { operator: Address },
+    /// SELF-CERTIFYING: an admitted operator registers its keys + jurisdiction.
+    /// The sender must be the address derived from `ed25519_pub`.
+    ComputeRegister {
+        ed25519_pub: [u8; 32],
+        x25519_pub: [u8; 32],
+        /// ISO-3166 alpha-2 processing jurisdiction.
+        jurisdiction: String,
+    },
+    /// GOVERNANCE: anchor a batch of off-chain job receipts by Merkle root (§6.5).
+    ComputeAnchor {
+        merkle_root: [u8; 32],
+        batch_count: u32,
+    },
+    /// GOVERNANCE/referee: slash a cheating operator (§6.5).
+    ComputeSlash {
+        operator: Address,
+        reputation_penalty: u64,
+        severe: bool,
+    },
 }
 
 impl TxPayload {
@@ -150,11 +188,21 @@ impl TxPayload {
             TxPayload::DidCreate { .. } => FEE_DID_CREATE,
             TxPayload::DidUpdate { .. } => FEE_DID_UPDATE,
             TxPayload::DidDeactivate { .. } => FEE_DID_DEACTIVATE,
-            TxPayload::CredentialIssue { credential_type, .. } => credential_type.issue_fee(),
-            TxPayload::CredentialIssueBbs { credential_type, .. } => credential_type.issue_fee_bbs(),
+            TxPayload::CredentialIssue {
+                credential_type, ..
+            } => credential_type.issue_fee(),
+            TxPayload::CredentialIssueBbs {
+                credential_type, ..
+            } => credential_type.issue_fee_bbs(),
             TxPayload::CredentialRevoke { .. } => FEE_CREDENTIAL_REVOKE,
             TxPayload::Stake { .. } => FEE_STAKE,
             TxPayload::Unstake { .. } => FEE_UNSTAKE,
+            TxPayload::DidRecover { .. } => FEE_DID_RECOVER,
+            TxPayload::ComputeAdmit { .. }
+            | TxPayload::ComputeRemove { .. }
+            | TxPayload::ComputeRegister { .. }
+            | TxPayload::ComputeAnchor { .. }
+            | TxPayload::ComputeSlash { .. } => FEE_COMPUTE,
         }
     }
 }
@@ -182,11 +230,10 @@ impl Transaction {
     ///
     /// `BLAKE3(sender_pubkey || nonce_le_bytes || serde_json(payload))`
     pub fn signing_bytes(&self) -> [u8; 32] {
-        let payload_json = serde_json::to_vec(&self.payload)
-            .expect("TxPayload serialization cannot fail");
+        let payload_json =
+            serde_json::to_vec(&self.payload).expect("TxPayload serialization cannot fail");
 
-        let mut buf =
-            Vec::with_capacity(32 + 8 + payload_json.len());
+        let mut buf = Vec::with_capacity(32 + 8 + payload_json.len());
         buf.extend_from_slice(&self.sender_pubkey);
         buf.extend_from_slice(&self.nonce.to_le_bytes());
         buf.extend_from_slice(&payload_json);
@@ -198,8 +245,7 @@ impl Transaction {
     ///
     /// `BLAKE3(serde_json(self))`
     pub fn hash(&self) -> [u8; 32] {
-        let encoded = serde_json::to_vec(self)
-            .expect("Transaction serialization cannot fail");
+        let encoded = serde_json::to_vec(self).expect("Transaction serialization cannot fail");
         blake3_hash(&encoded)
     }
 
@@ -243,10 +289,7 @@ pub enum Event {
         amount: u64,
     },
     /// A new DID document was registered.
-    DidCreated {
-        did: String,
-        controller: Address,
-    },
+    DidCreated { did: String, controller: Address },
     /// An existing DID document was updated.
     DidUpdated { did: String },
     /// A DID document was permanently deactivated.
@@ -270,6 +313,32 @@ pub enum Event {
         validator: Address,
         amount: u64,
         remaining_stake: u64,
+    },
+    /// A DID's key was rotated through guardian recovery.
+    DidRecovered { did: String },
+    /// A compute operator was admitted to the allow-list (§6.2.4).
+    ComputeAdmitted {
+        operator: Address,
+        tier: ComputeTier,
+    },
+    /// A compute operator was removed from the network.
+    ComputeRemoved { operator: Address },
+    /// A compute operator registered its keys.
+    ComputeRegistered {
+        operator: Address,
+        jurisdiction: String,
+        tier: ComputeTier,
+    },
+    /// A batch of job receipts was anchored (§6.5).
+    ComputeAnchored {
+        merkle_root: [u8; 32],
+        batch_count: u32,
+    },
+    /// A compute operator was slashed.
+    ComputeSlashed {
+        operator: Address,
+        severe: bool,
+        reputation: u64,
     },
 }
 
@@ -348,10 +417,7 @@ mod tests {
         let mut tx = make_transfer_tx(&sender, to, 50_000, 0);
 
         // Tamper with the amount — the signature should no longer match.
-        tx.payload = TxPayload::Transfer {
-            to,
-            amount: 99_999,
-        };
+        tx.payload = TxPayload::Transfer { to, amount: 99_999 };
         assert!(!tx.verify_signature());
     }
 
@@ -390,7 +456,7 @@ mod tests {
             bbs_pubkey: [0u8; 96],
             bbs_message_count: 8,
         };
-        // KycL2 base fee 5 SOLID = 500_000_000; BBS = 1.25x = 625_000_000
+        // KycL2 base fee 5 SLDS = 500_000_000; BBS = 1.25x = 625_000_000
         assert_eq!(payload.fee(), 625_000_000);
     }
 
@@ -427,6 +493,19 @@ mod tests {
         let msg = tx.signing_bytes();
         tx.signature = sign(&sender, &msg);
         assert!(tx.verify_signature());
+    }
+
+    #[test]
+    fn did_recover_fee_and_roundtrip() {
+        let payload = TxPayload::DidRecover {
+            did: "did:solidus:testnet:s".into(),
+            new_public_key: [9u8; 32],
+            approvals: vec![],
+        };
+        assert_eq!(payload.fee(), FEE_DID_RECOVER);
+        let json = serde_json::to_vec(&payload).unwrap();
+        let back: TxPayload = serde_json::from_slice(&json).unwrap();
+        assert_eq!(payload, back);
     }
 
     #[test]

@@ -14,10 +14,13 @@ use solidus_consensus::mempool::Mempool;
 use solidus_consensus::proposer::{Proposer, ProposerConfig};
 use solidus_crypto::ed25519::{generate_signing_key, sign};
 use solidus_crypto::keys::Address;
+use solidus_rpc::methods::ChainMeta;
 use solidus_rpc::server::start_rpc_server;
 use solidus_rpc::types::{RpcBlock, RpcReceipt};
 use solidus_state::account::{Account, AccountType};
-use solidus_state::executor::save_account;
+use solidus_state::executor::{
+    block_touched_accounts, mirror_account_to_committed, save_account, save_committed_account,
+};
 use solidus_state::store::Store;
 use solidus_txns::types::{Transaction, TxPayload, FEE_TRANSFER};
 
@@ -58,6 +61,10 @@ async fn transfer_via_rpc_updates_balance() {
     {
         let account = Account::with_balance(sender_addr, initial_balance, AccountType::Regular);
         save_account(&store, &account).expect("fund sender failed");
+        // RPC `getBalance` reads CF_COMMITTED_ACCOUNTS now (was CF_ACCOUNTS).
+        // Seed the committed view too so the initial balance is visible —
+        // mirrors what `load_genesis` does for production startup.
+        save_committed_account(&store, &account).expect("seed committed view failed");
     }
 
     // Define auxiliary addresses.
@@ -78,6 +85,10 @@ async fn transfer_via_rpc_updates_balance() {
         Arc::clone(&store),
         Arc::clone(&mempool),
         Arc::clone(&latest_height),
+        Arc::new(Vec::new()),
+        ChainMeta::default(),
+        None, // single-node test — no peers to gossip to
+        std::sync::Arc::new(tokio::sync::Notify::new()),
     )
     .await
     .expect("failed to start RPC server");
@@ -105,7 +116,11 @@ async fn transfer_via_rpc_updates_balance() {
         .expect("solidus_sendTransaction failed");
 
     assert!(!tx_hash.is_empty(), "tx_hash should be non-empty");
-    assert_eq!(tx_hash.len(), 64, "tx_hash should be 64 hex chars (32 bytes)");
+    assert_eq!(
+        tx_hash.len(),
+        64,
+        "tx_hash should be 64 hex chars (32 bytes)"
+    );
 
     // -----------------------------------------------------------------------
     // 5. Run proposer once
@@ -122,8 +137,8 @@ async fn transfer_via_rpc_updates_balance() {
         Arc::clone(&store),
         Arc::clone(&mempool),
         config,
-        0,           // genesis_height
-        [0u8; 32],   // genesis_hash
+        0,         // genesis_height
+        [0u8; 32], // genesis_hash
     );
 
     let result = proposer
@@ -135,6 +150,20 @@ async fn transfer_via_rpc_updates_balance() {
     assert_eq!(block.header.height, 1);
     assert_eq!(block.header.tx_count, 1);
     assert_eq!(receipts.len(), 1);
+
+    // Simulate `HotStuffEngine::try_commit`'s mirror step: copy this block's
+    // touched accounts from the live view (CF_ACCOUNTS, where execute_block
+    // wrote them) into the committed view (CF_COMMITTED_ACCOUNTS) that RPC
+    // reads. In production this is automatic on 3-chain finality; in this
+    // test we drive only the proposer, so we mirror manually.
+    let touched = block_touched_accounts(
+        &block.transactions,
+        &treasury_addr,
+        std::slice::from_ref(&validator_addr),
+    );
+    for addr in &touched {
+        mirror_account_to_committed(&store, addr).expect("mirror failed");
+    }
 
     // Update the shared latest_height so RPC queries work.
     *latest_height.lock().unwrap() = 1;
@@ -156,7 +185,10 @@ async fn transfer_via_rpc_updates_balance() {
 
     // 6b. Recipient balance: exactly the transfer amount
     let recipient_balance: u64 = client
-        .request("solidus_getBalance", rpc_params![recipient_addr.to_base58()])
+        .request(
+            "solidus_getBalance",
+            rpc_params![recipient_addr.to_base58()],
+        )
         .await
         .expect("solidus_getBalance(recipient) failed");
     assert_eq!(

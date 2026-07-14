@@ -1,0 +1,35 @@
+[package]
+name = "solidus-noded"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Solidus v2 node daemon — the deployable artifact: a config-driven validator (HotStuff-2 + two-lane executor + libp2p + JSON-RPC edge), plus a local-devnet config generator."
+
+[[bin]]
+name = "solidus-noded"
+path = "src/main.rs"
+
+[dependencies]
+solidus-node2 = { workspace = true }
+solidus-p2p2 = { workspace = true }
+solidus-rpc2 = { workspace = true }
+solidus-store2 = { workspace = true }
+solidus-exec = { workspace = true }
+solidus-hotstuff2 = { workspace = true }
+solidus-crypto = { workspace = true }
+solidus-txns = { workspace = true }
+tokio = { workspace = true }
+libp2p = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+anyhow = "1"
+jsonrpsee = { workspace = true }
+bincode = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

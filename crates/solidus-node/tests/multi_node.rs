@@ -51,6 +51,9 @@ fn setup_test_network(n: usize) -> (Vec<HotStuffEngine>, Vec<ChannelTransport>) 
 
     let mut engines = Vec::with_capacity(n);
 
+    // Same shape as the hotstuff.rs builder loop — i is the validator
+    // index, ed_keys is indexed, bls_keys is drained destructively.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let dir = tempdir().expect("failed to create temp dir");
         let store = Arc::new(Store::open(dir.path()).expect("failed to open store"));
@@ -60,7 +63,6 @@ fn setup_test_network(n: usize) -> (Vec<HotStuffEngine>, Vec<ChannelTransport>) 
 
         let config = HotStuffConfig {
             max_block_txs: 100,
-            block_time_ms: 1000,
             quorum_threshold,
             treasury_address: Address::from_bytes([0xAAu8; 20]),
             skip_vrf: false,
@@ -114,7 +116,7 @@ async fn four_nodes_one_round() {
     let leader = select_leader_from_outputs(&outputs);
 
     // Step 2: Leader builds a block and broadcasts the proposal.
-    let block = engines[leader].build_block();
+    let (block, _) = engines[leader].build_block();
     let proposal = ConsensusMessage::Proposal {
         block: block.clone(),
         justify_qc: None,
@@ -232,7 +234,10 @@ async fn leader_failure_triggers_timeout() {
     assert!(result1.is_none(), "TC should not form with 2 timeout votes");
 
     let result2 = engines[0].process_timeout_vote(tv2);
-    assert!(result2.is_some(), "TC should form with 3 timeout votes (quorum)");
+    assert!(
+        result2.is_some(),
+        "TC should form with 3 timeout votes (quorum)"
+    );
 
     let tc = result2.unwrap();
     assert_eq!(tc.round, round, "TC round should match the timed-out round");

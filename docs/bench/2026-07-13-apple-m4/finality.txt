@@ -1,0 +1,10 @@
+   Compiling solidus-hotstuff2 v0.1.0 (/Users/fatih/Documents/Works/solidus.network/projects/protocol/apps/consensus/crates/solidus-hotstuff2)
+    Finished `release` profile [optimized] target(s) in 0.55s
+     Running tests/four_node.rs (target/release/deps/four_node-3ac590384256de84)
+
+running 1 test
+four_node happy path: 604 commit observations, finality p50=7.742833ms p99=16.331375ms (in-process loopback on this machine — protocol overhead, not network finality)
+test happy_path_commits_and_measures_finality ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.58s
+

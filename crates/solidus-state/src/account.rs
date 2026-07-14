@@ -27,7 +27,7 @@ pub struct Account {
     pub address: Address,
     /// Monotonically increasing nonce (replay protection).
     pub nonce: u64,
-    /// Balance in the smallest denomination (1 SOLID = 10^8).
+    /// Balance in the smallest denomination (1 SLDS = 10^8).
     pub balance: u64,
     /// The type of account.
     pub account_type: AccountType,
@@ -56,8 +56,20 @@ impl Account {
     }
 
     /// Serialize the account to bytes using bincode.
+    ///
+    /// Infallible: `Account` is a fixed-shape POD struct (`Address` is
+    /// `[u8; 20]`, `AccountType` is a `repr`-fixed enum, `balance` and
+    /// `nonce` are `u64`). None of bincode's serializer error paths can
+    /// fire on this input — the only way to "fail" would be an allocator
+    /// OOM, and at that point the process is unrecoverable anyway. We
+    /// keep the `expect` as a tripwire: if anyone widens the struct to
+    /// include a fallible type (e.g. an `Option<Vec<u8>>` with non-trivial
+    /// serde), the panic message immediately fingers this site.
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("Account serialization cannot fail")
+        #[allow(clippy::expect_used)]
+        let bytes =
+            bincode::serialize(self).expect("Account serialization cannot fail (POD struct)");
+        bytes
     }
 
     /// Deserialize an account from bytes produced by [`to_bytes`](Self::to_bytes).

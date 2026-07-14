@@ -8,6 +8,18 @@ members = [
     "crates/solidus-p2p",
     "crates/solidus-rpc",
     "crates/solidus-node",
+    # ---- v2 rebuild (parallel network, new chain-id) ----
+    "crates/solidus-state-tree",
+    "crates/solidus-exec",
+    "crates/solidus-mempool-dag",
+    "crates/solidus-hotstuff2",
+    "crates/solidus-subnet",
+    "crates/solidus-store2",
+    "crates/solidus-evm",
+    "crates/solidus-node2",
+    "crates/solidus-rpc2",
+    "crates/solidus-p2p2",
+    "crates/solidus-noded",
 ]
 
 [workspace.package]
@@ -24,6 +36,16 @@ solidus-state = { path = "crates/solidus-state" }
 solidus-consensus = { path = "crates/solidus-consensus" }
 solidus-p2p = { path = "crates/solidus-p2p" }
 solidus-rpc = { path = "crates/solidus-rpc" }
+solidus-state-tree = { path = "crates/solidus-state-tree" }
+solidus-exec = { path = "crates/solidus-exec" }
+solidus-mempool-dag = { path = "crates/solidus-mempool-dag" }
+solidus-hotstuff2 = { path = "crates/solidus-hotstuff2" }
+solidus-subnet = { path = "crates/solidus-subnet" }
+solidus-store2 = { path = "crates/solidus-store2" }
+solidus-evm = { path = "crates/solidus-evm" }
+solidus-node2 = { path = "crates/solidus-node2" }
+solidus-rpc2 = { path = "crates/solidus-rpc2" }
+solidus-p2p2 = { path = "crates/solidus-p2p2" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -45,12 +67,20 @@ serde_json = "1"
 bincode = "1"
 
 # RPC
-jsonrpsee = { version = "0.24", features = ["server"] }
+jsonrpsee = { version = "0.24", features = ["server", "client", "http-client", "macros"] }
 
 # Networking
-libp2p = { version = "0.54", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "tokio", "macros", "ed25519"] }
+libp2p = { version = "0.54", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "cbor", "tokio", "macros", "ed25519", "kad", "identify"] }
 async-trait = "0.1"
 bitvec = { version = "1", features = ["serde"] }
+
+# Parallelism (v2 payment lane)
+rayon = "1.10"
+
+# Test / bench harness (v2 differential + criterion gates)
+criterion = "0.5"
+proptest = "1"
+tempfile = "3"
 
 # Utilities
 tracing = "0.1"

@@ -14,6 +14,7 @@ use jsonrpsee::rpc_params;
 use solidus_consensus::mempool::Mempool;
 use solidus_crypto::ed25519::{generate_signing_key, sign};
 use solidus_crypto::keys::Address;
+use solidus_rpc::methods::ChainMeta;
 use solidus_rpc::server::start_rpc_server;
 use solidus_state::account::{Account, AccountType};
 use solidus_state::executor::{execute_block, save_account};
@@ -26,11 +27,7 @@ use solidus_txns::types::{Transaction, TxPayload, TxStatus, FEE_STAKE};
 // ---------------------------------------------------------------------------
 
 /// Build a signed Stake transaction.
-fn make_stake_tx(
-    sender_key: &ed25519_dalek::SigningKey,
-    amount: u64,
-    nonce: u64,
-) -> Transaction {
+fn make_stake_tx(sender_key: &ed25519_dalek::SigningKey, amount: u64, nonce: u64) -> Transaction {
     let pubkey = sender_key.verifying_key().to_bytes();
     let payload = TxPayload::Stake { amount };
 
@@ -62,9 +59,9 @@ async fn stake_and_query_via_rpc() {
     let latest_height = Arc::new(Mutex::new(0u64));
 
     // -----------------------------------------------------------------------
-    // 2. Fund the validator account with 200K SOLID (in smallest units)
+    // 2. Fund the validator account with 200K SLDS (in smallest units)
     //
-    //    MIN_STAKE = 100_000_000_000 (1000 SOLID)
+    //    MIN_STAKE = 1_000_000_000_000 (10,000 SLDS)
     //    We fund with 2 * MIN_STAKE + FEE_STAKE to cover: stake amount + fee.
     // -----------------------------------------------------------------------
     let validator_key = generate_signing_key();
@@ -88,6 +85,10 @@ async fn stake_and_query_via_rpc() {
         Arc::clone(&store),
         Arc::clone(&mempool),
         Arc::clone(&latest_height),
+        Arc::new(Vec::new()),
+        ChainMeta::default(),
+        None,
+        std::sync::Arc::new(tokio::sync::Notify::new()),
     )
     .await
     .expect("failed to start RPC server");
@@ -102,6 +103,7 @@ async fn stake_and_query_via_rpc() {
         &store,
         &[tx_stake],
         1,
+        1_700_000_000_000,
         &treasury_addr,
         &[block_validator_addr],
         "testnet",
@@ -145,8 +147,7 @@ async fn stake_and_query_via_rpc() {
         "validator should be active after staking"
     );
     assert_eq!(
-        info["staked"],
-        MIN_STAKE,
+        info["staked"], MIN_STAKE,
         "staked amount should equal MIN_STAKE"
     );
     assert_eq!(
@@ -174,7 +175,10 @@ async fn stake_and_query_via_rpc() {
     let found = validators
         .iter()
         .any(|v| v["address"] == validator_addr.to_base58());
-    assert!(found, "our validator should appear in get_validators result");
+    assert!(
+        found,
+        "our validator should appear in get_validators result"
+    );
 
     // Graceful shutdown.
     server_handle.stop().expect("server should stop");

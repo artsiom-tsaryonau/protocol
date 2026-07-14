@@ -1,0 +1,35 @@
+[package]
+name = "solidus-evm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Solidus v2 EVM subnet: REVM + 3 identity precompiles reading L1-finalized DID/credential state via inclusion proofs"
+
+[dependencies]
+solidus-subnet = { workspace = true }
+solidus-state-tree = { workspace = true }
+solidus-crypto = { workspace = true }
+solidus-txns = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+revm = "14"
+# Raw-tx decode + ECDSA sender recovery for eth_sendRawTransaction. Both are
+# already in the tree via revm@14 (alloy-primitives 0.8, alloy-rlp 0.3) — the
+# `k256` feature turns on secp256k1 signature recovery.
+alloy-rlp = "0.3"
+alloy-primitives = { version = "0.8", features = ["k256"] }
+
+[dev-dependencies]
+solidus-exec = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+criterion = { workspace = true }
+hex = { workspace = true }
+
+[[bench]]
+name = "precompiles"
+harness = false

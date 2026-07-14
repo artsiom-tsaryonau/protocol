@@ -1,0 +1,26 @@
+[package]
+name = "solidus-store2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Solidus v2 storage: binary, one WriteBatch per block, hot/cold column families, tuning profiles, pruning"
+
+[dependencies]
+solidus-exec = { workspace = true }
+solidus-txns = { workspace = true }
+rocksdb = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+solidus-crypto = { workspace = true }
+solidus-state-tree = { workspace = true }
+ed25519-dalek = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "store2"
+harness = false

@@ -70,12 +70,7 @@ pub fn vrf_prove(sk: &SigningKey, input: &[u8]) -> (VrfOutput, VrfProof) {
 /// Returns `true` only if:
 /// 1. `proof` is a valid Ed25519 signature of `input` under `pk`, and
 /// 2. `output == BLAKE3(proof)`.
-pub fn vrf_verify(
-    pk: &VerifyingKey,
-    input: &[u8],
-    output: &VrfOutput,
-    proof: &VrfProof,
-) -> bool {
+pub fn vrf_verify(pk: &VerifyingKey, input: &[u8], output: &VrfOutput, proof: &VrfProof) -> bool {
     let sig = Signature::from_bytes(&proof.0);
     if pk.verify(input, &sig).is_err() {
         return false;

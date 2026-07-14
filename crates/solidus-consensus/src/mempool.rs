@@ -84,8 +84,7 @@ impl Mempool {
     /// that may still be lingering in the pool (e.g. if they were re-inserted
     /// between `take` and commit).
     pub fn remove_committed(&mut self, tx_hashes: &[[u8; 32]]) {
-        let committed: HashMap<[u8; 32], ()> =
-            tx_hashes.iter().map(|h| (*h, ())).collect();
+        let committed: HashMap<[u8; 32], ()> = tx_hashes.iter().map(|h| (*h, ())).collect();
 
         self.txs.retain(|tx| {
             let h = tx.hash();

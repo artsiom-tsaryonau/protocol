@@ -1,0 +1,28 @@
+[package]
+name = "solidus-p2p2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Solidus v2 networking: gossipsub for proposals/QCs/TCs/timeout-votes/batches, point-to-point for votes/acks. Wire codec + topic routing + libp2p behaviour."
+
+[dependencies]
+solidus-hotstuff2 = { workspace = true }
+solidus-mempool-dag = { workspace = true }
+solidus-node2 = { workspace = true }
+solidus-txns = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+libp2p = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+solidus-crypto = { workspace = true }
+solidus-exec = { workspace = true }
+solidus-store2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

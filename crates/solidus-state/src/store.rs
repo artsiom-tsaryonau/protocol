@@ -7,7 +7,20 @@ use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 // ---------------------------------------------------------------------------
 
 /// Column family for account state (address -> Account).
+///
+/// Holds the LIVE / speculative view: writes during `execute_block`
+/// (proposer-side and receiver-side validation) land here immediately,
+/// before the block reaches 3-chain commit. Use [`CF_COMMITTED_ACCOUNTS`]
+/// for reads that must reflect finalized state only.
 pub const CF_ACCOUNTS: &str = "accounts";
+
+/// Column family for the COMMITTED account view (address -> Account).
+///
+/// A mirror of [`CF_ACCOUNTS`] kept current by `HotStuffEngine::try_commit`:
+/// when a block is finalized via 3-chain, its touched accounts are copied
+/// from `CF_ACCOUNTS` here. RPC reads (`getBalance`/`getNonce`) target this
+/// CF so callers see only finalized balances, not in-flight speculation.
+pub const CF_COMMITTED_ACCOUNTS: &str = "committed_accounts";
 /// Column family for full blocks (height -> Block).
 pub const CF_BLOCKS: &str = "blocks";
 /// Column family for block headers (height -> Header).
@@ -20,16 +33,41 @@ pub const CF_MERKLE: &str = "merkle";
 pub const CF_DIDS: &str = "dids";
 /// Column family for credential records (credential_id -> CredentialRecord bytes).
 pub const CF_CREDENTIALS: &str = "credentials";
+
+/// Owned key-value pairs returned by [`Store::iter_cf`].
+pub type CfEntries = Vec<(Vec<u8>, Vec<u8>)>;
 /// Column family for credential index by subject DID (subject_did -> [credential_id]).
 pub const CF_CRED_BY_SUBJECT: &str = "cred_by_subject";
 /// Column family for credential index by issuer DID (issuer_did -> [credential_id]).
 pub const CF_CRED_BY_ISSUER: &str = "cred_by_issuer";
 /// Column family for validator records (address_bytes -> ValidatorInfo).
 pub const CF_VALIDATORS: &str = "validators";
+/// Committed blocks keyed by their content hash (the canonical-ledger store).
+pub const CF_BLOCK_BY_HASH: &str = "block_by_hash";
+/// Contiguous canonical index: seq (u64 LE) -> block hash ([u8;32]).
+pub const CF_CANON: &str = "canon";
+/// Small metadata keys (canon head pointer).
+pub const CF_META: &str = "meta";
+
+// Compute-network CFs (Rebuild #5 §6.5). AUXILIARY — deliberately NOT part of the
+// 4-tree global state root, so adding them does not fork the live chain. Pre-
+// mainnet the "stake" is reputation/points (no consensus-critical value); at
+// mainnet the registry graduates into the state root as a fifth tree.
+/// Compute allow-list: operator address -> ComputeAllowEntry.
+pub const CF_COMPUTE_ALLOWLIST: &str = "compute_allowlist";
+/// Compute node registry: operator address -> ComputeNodeInfo.
+pub const CF_COMPUTE_NODES: &str = "compute_nodes";
+/// Anchored receipt batches — append-only. Three disjoint key kinds, kept
+/// distinct by fixed length: anchor seq (u64 LE, 8 bytes) -> ComputeReceiptAnchor
+/// (the primary record); Merkle root (32 bytes) -> anchor seq (u64 LE)
+/// (duplicate-root index); and `meta:next_anchor_seq` (20 bytes) -> next seq
+/// (u64 LE). A repeat root is rejected, never overwriting the prior record.
+pub const CF_COMPUTE_ANCHORS: &str = "compute_anchors";
 
 /// All column families used by the store.
 pub const COLUMN_FAMILIES: &[&str] = &[
     CF_ACCOUNTS,
+    CF_COMMITTED_ACCOUNTS,
     CF_BLOCKS,
     CF_HEADERS,
     CF_RECEIPTS,
@@ -39,6 +77,12 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     CF_CRED_BY_SUBJECT,
     CF_CRED_BY_ISSUER,
     CF_VALIDATORS,
+    CF_BLOCK_BY_HASH,
+    CF_CANON,
+    CF_META,
+    CF_COMPUTE_ALLOWLIST,
+    CF_COMPUTE_NODES,
+    CF_COMPUTE_ANCHORS,
 ];
 
 // ---------------------------------------------------------------------------
@@ -86,12 +130,12 @@ impl Store {
         // an hour from empty-block churn alone. These caps keep growth bounded
         // without meaningfully hurting throughput at the testnet block rate.
         opts.set_max_total_wal_size(64 * 1024 * 1024); // 64 MiB total WAL across all CFs
-        opts.set_keep_log_file_num(1);                  // one rolling LOG, not 1000
-        opts.set_recycle_log_file_num(0);               // don't keep recycled WALs
-        opts.set_max_open_files(128);                   // bound fd usage
+        opts.set_keep_log_file_num(1); // one rolling LOG, not 1000
+        opts.set_recycle_log_file_num(0); // don't keep recycled WALs
+        opts.set_max_open_files(128); // bound fd usage
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_write_buffer_size(8 * 1024 * 1024);   // 8 MiB memtable per CF
-        opts.set_max_write_buffer_number(2);            // small flush queue
+        opts.set_write_buffer_size(8 * 1024 * 1024); // 8 MiB memtable per CF
+        opts.set_max_write_buffer_number(2); // small flush queue
         opts.set_target_file_size_base(8 * 1024 * 1024); // 8 MiB SSTs at L0
         opts.set_max_bytes_for_level_base(64 * 1024 * 1024); // 64 MiB L1 cap
         opts.set_level_compaction_dynamic_level_bytes(true); // smarter level sizing
@@ -156,7 +200,7 @@ impl Store {
     }
 
     /// Iterate over all key-value pairs in a column family.
-    pub fn iter_cf(&self, cf_name: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+    pub fn iter_cf(&self, cf_name: &str) -> Result<CfEntries, StoreError> {
         let cf = self
             .db
             .cf_handle(cf_name)
@@ -255,9 +299,7 @@ mod tests {
     #[test]
     fn get_missing_key_returns_none() {
         let store = open_tmp();
-        let val = store
-            .get(CF_ACCOUNTS, b"nonexistent")
-            .expect("get failed");
+        let val = store.get(CF_ACCOUNTS, b"nonexistent").expect("get failed");
         assert!(val.is_none());
     }
 
@@ -267,9 +309,7 @@ mod tests {
         store
             .put(CF_BLOCKS, b"block_0", b"data")
             .expect("put failed");
-        store
-            .delete(CF_BLOCKS, b"block_0")
-            .expect("delete failed");
+        store.delete(CF_BLOCKS, b"block_0").expect("delete failed");
         let val = store.get(CF_BLOCKS, b"block_0").expect("get failed");
         assert!(val.is_none());
     }
@@ -326,6 +366,25 @@ mod tests {
         assert!(
             matches!(err, StoreError::CfNotFound(ref name) if name == "nonexistent_cf"),
             "expected CfNotFound, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn new_canonical_cfs_are_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.put(CF_BLOCK_BY_HASH, b"h", b"block").unwrap();
+        store.put(CF_CANON, &0u64.to_le_bytes(), b"hash").unwrap();
+        store
+            .put(CF_META, b"canon_head_seq", &0u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            store.get(CF_BLOCK_BY_HASH, b"h").unwrap().as_deref(),
+            Some(&b"block"[..])
+        );
+        assert_eq!(
+            store.get(CF_CANON, &0u64.to_le_bytes()).unwrap().as_deref(),
+            Some(&b"hash"[..])
         );
     }
 }

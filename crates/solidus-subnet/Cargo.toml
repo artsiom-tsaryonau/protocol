@@ -1,0 +1,17 @@
+[package]
+name = "solidus-subnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Avalanche-L1-style subnet framework for Solidus v2 (Stage 0: frozen Subnet trait + L1 root bridge message; runtime lands in Stage 5)"
+
+[dependencies]
+solidus-state-tree = { workspace = true }
+solidus-hotstuff2 = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+solidus-crypto = { workspace = true }

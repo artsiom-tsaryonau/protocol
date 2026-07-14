@@ -1,21 +1,28 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
-use tracing::error;
+use tracing::{debug, error};
 
 use solidus_consensus::mempool::Mempool;
-use solidus_consensus::types::Block;
+use solidus_consensus::types::{Block, ValidatorIdentity};
 use solidus_crypto::keys::Address;
-use solidus_state::executor::{load_account, load_credential, load_credential_ids, load_validator};
-use solidus_state::store::{Store, CF_BLOCKS, CF_CRED_BY_ISSUER, CF_CRED_BY_SUBJECT, CF_RECEIPTS, CF_VALIDATORS};
+use solidus_state::executor::{
+    load_committed_account, load_credential, load_credential_ids, load_validator,
+};
+use solidus_state::store::{
+    Store, CF_BLOCKS, CF_CRED_BY_ISSUER, CF_CRED_BY_SUBJECT, CF_RECEIPTS, CF_VALIDATORS,
+};
 use solidus_txns::staking::ValidatorInfo;
 use solidus_txns::types::{Receipt, Transaction};
 
 use crate::types::{
-    RpcBlock, RpcCredentialProofResult, RpcCredentialRecord, RpcCredentialVerifyResult,
-    RpcDidDocument, RpcDisclosedMessage, RpcReceipt, RpcValidatorInfo,
+    NodeInfo, RpcBlock, RpcCanonHead, RpcChainInfo, RpcCredentialProofResult, RpcCredentialRecord,
+    RpcCredentialVerifyResult, RpcDidDocument, RpcDisclosedMessage, RpcNativeToken, RpcReceipt,
+    RpcValidatorInfo,
 };
 
 // ---------------------------------------------------------------------------
@@ -33,6 +40,27 @@ fn invalid_params(msg: impl Into<String>) -> ErrorObjectOwned {
 
 fn internal_error(msg: impl Into<String>) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(INTERNAL_ERROR, msg.into(), None::<()>)
+}
+
+/// Best-effort resident set size of the current process, in bytes.
+/// Reads `/proc/self/statm` on Linux; returns 0 on other platforms.
+fn current_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // statm fields are in pages: size resident shared text lib data dt
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(resident_pages) = statm.split_whitespace().nth(1) {
+                if let Ok(pages) = resident_pages.parse::<u64>() {
+                    return pages * 4096; // standard Linux page size
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +90,34 @@ pub trait SolidusApi {
     #[method(name = "solidus_getLatestBlock")]
     fn get_latest_block(&self) -> RpcResult<Option<RpcBlock>>;
 
+    /// Return a block by its contiguous canonical sequence number
+    /// (`CF_CANON` index), or `null` if no block is canonized at `seq`.
+    ///
+    /// `seq` is the authoritative chain position. Prefer this over
+    /// `solidus_getBlock`'s height-based lookup when the caller needs
+    /// contiguous indexing — e.g. block explorers that iterate every block.
+    #[method(name = "solidus_getBlockBySeq")]
+    fn get_block_by_seq(&self, seq: u64) -> RpcResult<Option<RpcBlock>>;
+
+    /// Return the head of the contiguous canonical ledger (max seq + hash),
+    /// or `null` if no blocks have been canonized yet.
+    #[method(name = "solidus_canonHead")]
+    fn canon_head(&self) -> RpcResult<Option<RpcCanonHead>>;
+
+    /// Return just the latest committed block height.
+    #[method(name = "solidus_blockNumber")]
+    fn block_number(&self) -> RpcResult<u64>;
+
+    /// Return chain metadata: id, native token, genesis hash, latest height,
+    /// and node version. Wallets, explorers, indexers, and listing
+    /// aggregators hit this to confirm the chain self-describes correctly.
+    #[method(name = "solidus_chainInfo")]
+    fn chain_info(&self) -> RpcResult<RpcChainInfo>;
+
+    /// Process-level node observability: version, uptime, resident memory.
+    #[method(name = "solidus_nodeInfo")]
+    fn node_info(&self) -> RpcResult<NodeInfo>;
+
     /// Return the receipt for a transaction identified by its hex hash.
     #[method(name = "solidus_getReceipt")]
     fn get_receipt(&self, tx_hash: String) -> RpcResult<Option<RpcReceipt>>;
@@ -78,7 +134,10 @@ pub trait SolidusApi {
     /// Verify a credential by ID. Returns validity status and the credential
     /// record, or `null` if the credential does not exist.
     #[method(name = "solidus_credentialVerify")]
-    fn credential_verify(&self, credential_id: String) -> RpcResult<Option<RpcCredentialVerifyResult>>;
+    fn credential_verify(
+        &self,
+        credential_id: String,
+    ) -> RpcResult<Option<RpcCredentialVerifyResult>>;
 
     /// Return all credentials where the given DID is the subject.
     #[method(name = "solidus_credentialsBySubject")]
@@ -132,37 +191,100 @@ pub trait SolidusApi {
 // Implementation
 // ---------------------------------------------------------------------------
 
+/// Static chain metadata fixed at node startup. Supplied by the node binary
+/// from the loaded genesis config and surfaced verbatim by `solidus_chainInfo`.
+#[derive(Debug, Clone)]
+pub struct ChainMeta {
+    /// Chain identifier from `GenesisConfig::chain_id`.
+    pub chain_id: String,
+    /// Native token metadata from `GenesisConfig::native_token`.
+    pub native_token: RpcNativeToken,
+    /// Node software version (`CARGO_PKG_VERSION` of the node binary).
+    pub version: String,
+}
+
+impl Default for ChainMeta {
+    /// Sentinel default for tests and RPC servers run without a genesis
+    /// config. The `TESTNET-SOLI` symbol mirrors `NativeTokenMetadata`'s
+    /// sentinel so a missing-metadata chain is obvious over RPC.
+    fn default() -> Self {
+        Self {
+            chain_id: "solidus-testnet".to_string(),
+            native_token: RpcNativeToken {
+                symbol: "TESTNET-SOLI".to_string(),
+                name: "Solidus (testnet, no metadata)".to_string(),
+                decimals: 8,
+            },
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
 /// Holds shared state required by the RPC methods.
 pub struct SolidusRpcImpl {
     pub store: Arc<Store>,
     pub mempool: Arc<Mutex<Mempool>>,
     pub latest_height: Arc<Mutex<u64>>,
+    /// In-process consensus committee. Surfaced by `solidus_getValidators`
+    /// in addition to on-chain stake records so that dev/testnet networks
+    /// (which produce blocks without on-chain staking transactions) report
+    /// a non-empty validator set. May be empty when the RPC server is run
+    /// without an attached consensus engine (e.g. integration tests).
+    pub committee: Arc<Vec<ValidatorIdentity>>,
+    /// Static chain metadata surfaced by `solidus_chainInfo`.
+    pub chain_meta: ChainMeta,
+    /// Monotonic clock captured when this RPC impl was constructed; used for
+    /// `solidus_nodeInfo.uptime_seconds`.
+    pub start_time: Instant,
+    /// Optional fan-out channel: when set, `solidus_sendTransaction` pushes
+    /// every successfully-mempooled transaction here so the consensus loop
+    /// can broadcast it on the libp2p `txs` gossipsub topic. `None` for
+    /// standalone RPC tests (no networking) and the legacy single-node
+    /// mode (no peers to gossip to).
+    pub tx_broadcast: Option<tokio::sync::mpsc::UnboundedSender<Transaction>>,
+    /// Wake signal for the event-driven proposer: fired (`notify_waiters`)
+    /// the moment `solidus_sendTransaction` accepts a tx into the mempool,
+    /// so an idle consensus loop proposes immediately instead of waiting
+    /// for its next tick. Harmless no-op when nothing is parked on it.
+    pub tx_wake: Arc<tokio::sync::Notify>,
 }
 
 impl SolidusRpcImpl {
     /// Create a new RPC implementation with shared state.
+    ///
+    /// `committee` should contain the in-process consensus committee
+    /// members, or an empty `Vec` when no consensus engine is attached.
+    /// `tx_broadcast` should be `None` for tests / standalone RPC and
+    /// `Some(sender)` in the consensus + full-node paths where a libp2p
+    /// transport will fan out submitted transactions.
     pub fn new(
         store: Arc<Store>,
         mempool: Arc<Mutex<Mempool>>,
         latest_height: Arc<Mutex<u64>>,
+        committee: Arc<Vec<ValidatorIdentity>>,
+        chain_meta: ChainMeta,
+        tx_broadcast: Option<tokio::sync::mpsc::UnboundedSender<Transaction>>,
+        tx_wake: Arc<tokio::sync::Notify>,
     ) -> Self {
         Self {
             store,
             mempool,
             latest_height,
+            committee,
+            chain_meta,
+            start_time: Instant::now(),
+            tx_broadcast,
+            tx_wake,
         }
     }
 
     /// Load a block from the store by height.
     fn load_block(&self, height: u64) -> RpcResult<Option<Block>> {
         let key = height.to_le_bytes();
-        let bytes = self
-            .store
-            .get(CF_BLOCKS, &key)
-            .map_err(|e| {
-                error!("failed to read block at height {height}: {e}");
-                internal_error(format!("store error: {e}"))
-            })?;
+        let bytes = self.store.get(CF_BLOCKS, &key).map_err(|e| {
+            error!("failed to read block at height {height}: {e}");
+            internal_error(format!("store error: {e}"))
+        })?;
 
         match bytes {
             None => Ok(None),
@@ -182,11 +304,15 @@ impl SolidusApiServer for SolidusRpcImpl {
         let addr = Address::from_base58(&address)
             .map_err(|e| invalid_params(format!("invalid address: {e}")))?;
 
-        let account = load_account(&self.store, &addr)
-            .map_err(|e| {
-                error!("failed to load account {address}: {e}");
-                internal_error(format!("store error: {e}"))
-            })?;
+        // Read the COMMITTED view: see only balances from blocks that have
+        // reached 3-chain finality, never the speculative effects of
+        // validated-but-not-yet-committed blocks that `execute_block` writes
+        // into CF_ACCOUNTS. CF_COMMITTED_ACCOUNTS is mirrored by
+        // `HotStuffEngine::try_commit` and seeded by `load_genesis`.
+        let account = load_committed_account(&self.store, &addr).map_err(|e| {
+            error!("failed to load committed account {address}: {e}");
+            internal_error(format!("store error: {e}"))
+        })?;
 
         Ok(account.balance)
     }
@@ -195,11 +321,13 @@ impl SolidusApiServer for SolidusRpcImpl {
         let addr = Address::from_base58(&address)
             .map_err(|e| invalid_params(format!("invalid address: {e}")))?;
 
-        let account = load_account(&self.store, &addr)
-            .map_err(|e| {
-                error!("failed to load account {address}: {e}");
-                internal_error(format!("store error: {e}"))
-            })?;
+        // Read the COMMITTED view — same rationale as `get_balance` above.
+        // RPC callers (wallet/SDK) must use this as their next-tx nonce
+        // source so they don't double-spend against in-flight blocks.
+        let account = load_committed_account(&self.store, &addr).map_err(|e| {
+            error!("failed to load committed account {address}: {e}");
+            internal_error(format!("store error: {e}"))
+        })?;
 
         Ok(account.nonce)
     }
@@ -215,6 +343,10 @@ impl SolidusApiServer for SolidusRpcImpl {
         let tx_hash = tx.hash();
         let hex_hash = hex::encode(tx_hash);
 
+        // Clone before insert: insert moves the tx into the pool, but we
+        // need the tx to fan out to the broadcast channel below.
+        let tx_for_broadcast = tx.clone();
+
         let mut pool = self.mempool.lock().map_err(|e| {
             error!("mempool lock poisoned: {e}");
             internal_error("internal error")
@@ -224,6 +356,30 @@ impl SolidusApiServer for SolidusRpcImpl {
             return Err(invalid_params(
                 "transaction rejected: duplicate or mempool full",
             ));
+        }
+
+        // Drop the mempool lock BEFORE the broadcast send (the channel is
+        // unbounded but the receiver might be slow; never hold the mempool
+        // mutex across an await/IO point).
+        drop(pool);
+
+        // Wake any idle consensus loop so the current leader proposes NOW —
+        // proposing is event-driven (2026-07-13); there is no free-running
+        // block cycle to pick the tx up. If every loop is mid-iteration the
+        // wake is lost, which is fine: each loop re-checks the mempool on
+        // its next iteration (bounded by its 500ms backfill tick).
+        self.tx_wake.notify_waiters();
+
+        // Fan out to the libp2p `txs` gossipsub topic via the consensus
+        // loop. Best-effort: a closed channel just means the node is
+        // shutting down — local mempool insert already succeeded so the
+        // proposer (if this node is the next leader) will still include
+        // the tx in its next proposal. Any other receivers behind the
+        // gossip channel pick it up on their NewTransaction handler.
+        if let Some(tx_broadcast) = &self.tx_broadcast {
+            if tx_broadcast.send(tx_for_broadcast).is_err() {
+                debug!("tx broadcast channel closed; local mempool insert still succeeded");
+            }
         }
 
         Ok(hex_hash)
@@ -248,9 +404,90 @@ impl SolidusApiServer for SolidusRpcImpl {
         self.get_block(height)
     }
 
+    fn get_block_by_seq(&self, seq: u64) -> RpcResult<Option<RpcBlock>> {
+        // Look up the canonical hash for this seq, then fetch the block by
+        // hash from `CF_BLOCK_BY_HASH`. Both come from the canonical-ledger
+        // store (`solidus-consensus::ledger`) populated by `try_commit` and
+        // `rebuild_state_from_canon`.
+        let hash = match solidus_consensus::ledger::canon_get(&self.store, seq) {
+            Ok(Some(h)) => h,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                error!("canon_get({seq}) failed: {e}");
+                return Err(internal_error(format!("ledger error: {e}")));
+            }
+        };
+        match solidus_consensus::ledger::get_block_by_hash(&self.store, &hash) {
+            Ok(Some(block)) => Ok(Some(RpcBlock::from_block(&block))),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                error!("get_block_by_hash(seq={seq}) failed: {e}");
+                Err(internal_error(format!("ledger error: {e}")))
+            }
+        }
+    }
+
+    fn canon_head(&self) -> RpcResult<Option<RpcCanonHead>> {
+        match solidus_consensus::ledger::canon_head(&self.store) {
+            Ok(Some((seq, hash))) => Ok(Some(RpcCanonHead {
+                seq,
+                hash: hex::encode(hash),
+            })),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                error!("canon_head failed: {e}");
+                Err(internal_error(format!("ledger error: {e}")))
+            }
+        }
+    }
+
+    fn block_number(&self) -> RpcResult<u64> {
+        let height = *self.latest_height.lock().map_err(|e| {
+            error!("latest_height lock poisoned: {e}");
+            internal_error("internal error")
+        })?;
+        Ok(height)
+    }
+
+    fn chain_info(&self) -> RpcResult<RpcChainInfo> {
+        let latest_block = *self.latest_height.lock().map_err(|e| {
+            error!("latest_height lock poisoned: {e}");
+            internal_error("internal error")
+        })?;
+
+        // Genesis hash: the hash of block 0 when present, otherwise the
+        // deterministic chain_id-derived hash the node computes at genesis
+        // (blake3(chain_id), see solidus-node/main.rs). Block 0 isn't always
+        // persisted/loadable on the dev testnet, and returning an empty string
+        // there made every SDK consumer doing due diligence flag a "missing
+        // genesis" — the fallback keeps chain_info honest and non-empty.
+        let genesis_hash = match self.load_block(0)? {
+            Some(block) => hex::encode(block.hash()),
+            None => hex::encode(solidus_crypto::hash::blake3_hash(
+                self.chain_meta.chain_id.as_bytes(),
+            )),
+        };
+
+        Ok(RpcChainInfo {
+            chain_id: self.chain_meta.chain_id.clone(),
+            native_token: self.chain_meta.native_token.clone(),
+            genesis_hash,
+            latest_block,
+            version: self.chain_meta.version.clone(),
+        })
+    }
+
+    fn node_info(&self) -> RpcResult<NodeInfo> {
+        Ok(NodeInfo {
+            version: self.chain_meta.version.clone(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            rss_bytes: current_rss_bytes(),
+        })
+    }
+
     fn get_receipt(&self, tx_hash: String) -> RpcResult<Option<RpcReceipt>> {
-        let hash_bytes = hex::decode(&tx_hash)
-            .map_err(|e| invalid_params(format!("invalid hex hash: {e}")))?;
+        let hash_bytes =
+            hex::decode(&tx_hash).map_err(|e| invalid_params(format!("invalid hex hash: {e}")))?;
 
         if hash_bytes.len() != 32 {
             return Err(invalid_params(format!(
@@ -259,13 +496,10 @@ impl SolidusApiServer for SolidusRpcImpl {
             )));
         }
 
-        let bytes = self
-            .store
-            .get(CF_RECEIPTS, &hash_bytes)
-            .map_err(|e| {
-                error!("failed to read receipt for {tx_hash}: {e}");
-                internal_error(format!("store error: {e}"))
-            })?;
+        let bytes = self.store.get(CF_RECEIPTS, &hash_bytes).map_err(|e| {
+            error!("failed to read receipt for {tx_hash}: {e}");
+            internal_error(format!("store error: {e}"))
+        })?;
 
         match bytes {
             None => Ok(None),
@@ -288,7 +522,10 @@ impl SolidusApiServer for SolidusRpcImpl {
         }
     }
 
-    fn credential_verify(&self, credential_id: String) -> RpcResult<Option<RpcCredentialVerifyResult>> {
+    fn credential_verify(
+        &self,
+        credential_id: String,
+    ) -> RpcResult<Option<RpcCredentialVerifyResult>> {
         match load_credential(&self.store, &credential_id) {
             Ok(Some(cred)) => {
                 let revoked = cred.revoked;
@@ -341,8 +578,8 @@ impl SolidusApiServer for SolidusRpcImpl {
     }
 
     fn get_transaction(&self, tx_hash: String) -> RpcResult<Option<serde_json::Value>> {
-        let hash_bytes = hex::decode(&tx_hash)
-            .map_err(|e| invalid_params(format!("invalid hex hash: {e}")))?;
+        let hash_bytes =
+            hex::decode(&tx_hash).map_err(|e| invalid_params(format!("invalid hex hash: {e}")))?;
 
         if hash_bytes.len() != 32 {
             return Err(invalid_params(format!(
@@ -406,6 +643,7 @@ impl SolidusApiServer for SolidusRpcImpl {
 
         let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut validators = Vec::new();
+        let mut seen: HashSet<Address> = HashSet::new();
         for item in iter {
             let (_, value) = item.map_err(|e| {
                 error!("error iterating validators: {e}");
@@ -413,6 +651,7 @@ impl SolidusApiServer for SolidusRpcImpl {
             })?;
             match ValidatorInfo::from_bytes(&value) {
                 Ok(info) if info.active => {
+                    seen.insert(info.address);
                     validators.push(RpcValidatorInfo::from_validator(&info));
                 }
                 Ok(_) => {} // inactive validator — skip
@@ -422,6 +661,26 @@ impl SolidusApiServer for SolidusRpcImpl {
                 }
             }
         }
+
+        // Union with the in-process consensus committee. On dev/testnet
+        // networks the committee runs without on-chain staking transactions,
+        // so the on-chain set is empty even though blocks are being produced.
+        // Surfacing committee members here keeps `solidus_getValidators`
+        // honest about who is actually voting. On mainnet, on-chain rows
+        // already cover every committee member and `seen` filters duplicates,
+        // so this loop is a no-op.
+        for member in self.committee.iter() {
+            if seen.insert(member.address) {
+                validators.push(RpcValidatorInfo {
+                    address: member.address.to_base58(),
+                    staked: 0,
+                    unbonding: 0,
+                    reputation: 0,
+                    active: true,
+                });
+            }
+        }
+
         Ok(validators)
     }
 
@@ -440,8 +699,8 @@ impl SolidusApiServer for SolidusRpcImpl {
             .map_err(|e| invalid_params(format!("invalid proof hex: {e}")))?;
         let header = hex::decode(&header_hex)
             .map_err(|e| invalid_params(format!("invalid header hex: {e}")))?;
-        let ph = hex::decode(&ph_hex)
-            .map_err(|e| invalid_params(format!("invalid ph hex: {e}")))?;
+        let ph =
+            hex::decode(&ph_hex).map_err(|e| invalid_params(format!("invalid ph hex: {e}")))?;
 
         let mut sorted = disclosed_messages.clone();
         sorted.sort_by_key(|m| m.index);
@@ -515,8 +774,8 @@ impl SolidusApiServer for SolidusRpcImpl {
             .map_err(|e| invalid_params(format!("invalid proof hex: {e}")))?;
         let header = hex::decode(&header_hex)
             .map_err(|e| invalid_params(format!("invalid header hex: {e}")))?;
-        let ph = hex::decode(&ph_hex)
-            .map_err(|e| invalid_params(format!("invalid ph hex: {e}")))?;
+        let ph =
+            hex::decode(&ph_hex).map_err(|e| invalid_params(format!("invalid ph hex: {e}")))?;
 
         let mut sorted = disclosed_messages.clone();
         sorted.sort_by_key(|m| m.index);
@@ -577,12 +836,33 @@ mod tests {
         (Arc::new(store), dir)
     }
 
-    /// Helper: create an RPC impl with default shared state.
+    /// Helper: create an RPC impl with default shared state and an empty
+    /// committee.
     fn make_rpc(store: Arc<Store>) -> SolidusRpcImpl {
         SolidusRpcImpl::new(
             store,
             Arc::new(Mutex::new(Mempool::new())),
             Arc::new(Mutex::new(0)),
+            Arc::new(Vec::new()),
+            ChainMeta::default(),
+            None,
+            Arc::new(tokio::sync::Notify::new()),
+        )
+    }
+
+    /// Helper: create an RPC impl with a committee attached.
+    fn make_rpc_with_committee(
+        store: Arc<Store>,
+        committee: Vec<ValidatorIdentity>,
+    ) -> SolidusRpcImpl {
+        SolidusRpcImpl::new(
+            store,
+            Arc::new(Mutex::new(Mempool::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(committee),
+            ChainMeta::default(),
+            None,
+            Arc::new(tokio::sync::Notify::new()),
         )
     }
 
@@ -739,6 +1019,34 @@ mod tests {
     }
 
     #[test]
+    fn block_number_reflects_latest_height() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        // Default height is 0.
+        assert_eq!(rpc.block_number().unwrap(), 0);
+
+        // Reflects updates to the shared latest_height.
+        *rpc.latest_height.lock().unwrap() = 42;
+        assert_eq!(rpc.block_number().unwrap(), 42);
+    }
+
+    #[test]
+    fn node_info_returns_version_and_bounded_uptime() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let info = rpc.node_info().unwrap();
+
+        // Version mirrors the chain metadata (same source as solidus_chainInfo).
+        assert_eq!(info.version, ChainMeta::default().version);
+        // Just constructed, so uptime is small but defined.
+        assert!(info.uptime_seconds < 5);
+        // rss_bytes is 0 on non-Linux dev hosts and >0 on Linux; just exercise it.
+        let _ = info.rss_bytes;
+    }
+
+    #[test]
     fn get_receipt_missing() {
         let (store, _dir) = open_tmp();
         let rpc = make_rpc(store);
@@ -785,11 +1093,9 @@ mod tests {
         let (store, _dir) = open_tmp();
         let rpc = make_rpc(store);
 
-        let result = SolidusApiServer::did_resolve(
-            &rpc,
-            "did:solidus:testnet:nonexistent".to_string(),
-        )
-        .unwrap();
+        let result =
+            SolidusApiServer::did_resolve(&rpc, "did:solidus:testnet:nonexistent".to_string())
+                .unwrap();
         assert!(result.is_none());
     }
 
@@ -811,6 +1117,46 @@ mod tests {
         assert_eq!(rpc_doc.id, did);
         assert!(rpc_doc.active);
         assert_eq!(rpc_doc.created_ms, 1000);
+    }
+
+    #[test]
+    fn did_resolve_exposes_recovery_fields() {
+        use solidus_state::store::CF_DIDS;
+        use solidus_txns::did::{build_did_document, RecoveryPolicy};
+
+        let (store, _dir) = open_tmp();
+        let did = "did:solidus:testnet:recoverable";
+        let mut doc = build_did_document(did, "aabbcc", vec![], 1000);
+        doc.recovery_policy = Some(RecoveryPolicy {
+            guardians: vec![
+                "did:solidus:testnet:g1".to_string(),
+                "did:solidus:testnet:g2".to_string(),
+                "did:solidus:testnet:g3".to_string(),
+            ],
+            threshold: 2,
+            delay_blocks: 0,
+        });
+        doc.recovery_nonce = 7;
+        store.put(CF_DIDS, did.as_bytes(), &doc.to_bytes()).unwrap();
+
+        let rpc = make_rpc(store);
+        let result = SolidusApiServer::did_resolve(&rpc, did.to_string()).unwrap();
+        let rpc_doc = result.expect("recoverable DID should resolve");
+
+        assert_eq!(rpc_doc.recovery_nonce, 7);
+        let policy = rpc_doc
+            .recovery_policy
+            .expect("recovery_policy should be present on resolve");
+        assert_eq!(
+            policy.guardians,
+            vec![
+                "did:solidus:testnet:g1".to_string(),
+                "did:solidus:testnet:g2".to_string(),
+                "did:solidus:testnet:g3".to_string(),
+            ]
+        );
+        assert_eq!(policy.threshold, 2);
+        assert_eq!(policy.delay_blocks, 0);
     }
 
     #[test]
@@ -890,17 +1236,17 @@ mod tests {
             .unwrap();
 
         let rpc = make_rpc(store);
-        let result = SolidusApiServer::credential_verify(
-            &rpc,
-            "urn:solidus:credential:aabbcc".to_string(),
-        )
-        .unwrap();
+        let result =
+            SolidusApiServer::credential_verify(&rpc, "urn:solidus:credential:aabbcc".to_string())
+                .unwrap();
 
         assert!(result.is_some(), "should find stored credential");
         let verify = result.unwrap();
         assert!(verify.valid, "credential should be valid (not revoked)");
         assert!(!verify.revoked, "revoked flag should be false");
-        let rpc_cred = verify.credential.expect("credential field should be present");
+        let rpc_cred = verify
+            .credential
+            .expect("credential field should be present");
         assert_eq!(rpc_cred.id, "urn:solidus:credential:aabbcc");
         assert_eq!(rpc_cred.hash, hex::encode([0x11u8; 32]));
     }
@@ -930,6 +1276,90 @@ mod tests {
         let addr = Address::from_bytes([0xAB; 20]);
         let result = SolidusApiServer::get_validator_stake(&rpc, addr.to_base58()).unwrap();
         assert!(result.is_none(), "missing validator should return None");
+    }
+
+    /// Helper: build `n` synthetic committee identities with random keys.
+    fn make_committee(n: usize) -> Vec<ValidatorIdentity> {
+        use solidus_crypto::bls::BlsSecretKey;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let ed_sk = generate_signing_key();
+            let bls_sk = BlsSecretKey::generate();
+            out.push(ValidatorIdentity {
+                address: Address::from_public_key(&ed_sk.verifying_key()),
+                ed25519_pubkey: ed_sk.verifying_key().to_bytes(),
+                bls_pubkey: bls_sk.public_key(),
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn get_validators_returns_committee_when_no_onchain_validators() {
+        // Reproduces the dev-testnet case: 4 in-process consensus voters,
+        // zero on-chain staking transactions. The RPC must still surface the
+        // committee so the explorer's validator list is not empty.
+        let (store, _dir) = open_tmp();
+        let committee = make_committee(4);
+        let expected_addresses: HashSet<String> =
+            committee.iter().map(|v| v.address.to_base58()).collect();
+
+        let rpc = make_rpc_with_committee(store, committee);
+        let result = SolidusApiServer::get_validators(&rpc).expect("rpc call");
+
+        assert_eq!(result.len(), 4, "should surface all 4 committee members");
+        for v in &result {
+            assert!(v.active, "committee fallback entries must be active=true");
+            assert_eq!(v.staked, 0, "committee fallback has no on-chain stake");
+            assert_eq!(v.unbonding, 0);
+            assert_eq!(v.reputation, 0);
+        }
+        let returned: HashSet<String> = result.iter().map(|v| v.address.clone()).collect();
+        assert_eq!(
+            returned, expected_addresses,
+            "every committee member's address must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn get_validators_prefers_onchain_row_over_committee_duplicate() {
+        // When the same address appears both on-chain (with real stake) and
+        // in the in-process committee, the on-chain row must win so that
+        // production behaviour is unchanged.
+        use solidus_txns::staking::MIN_STAKE;
+
+        let (store, _dir) = open_tmp();
+        let committee = make_committee(2);
+
+        // Persist the first committee member as a real on-chain validator
+        // with a non-zero stake.
+        let on_chain_addr = committee[0].address;
+        let info = ValidatorInfo {
+            address: on_chain_addr,
+            staked: MIN_STAKE,
+            unbonding: 0,
+            unbonding_start_ms: None,
+            reputation: 750,
+            active: true,
+        };
+        store
+            .put(CF_VALIDATORS, on_chain_addr.as_bytes(), &info.to_bytes())
+            .unwrap();
+
+        let rpc = make_rpc_with_committee(store, committee);
+        let result = SolidusApiServer::get_validators(&rpc).expect("rpc call");
+
+        // 2 entries: one on-chain row + one committee-only fallback.
+        assert_eq!(result.len(), 2);
+        let on_chain = result
+            .iter()
+            .find(|v| v.address == on_chain_addr.to_base58())
+            .expect("on-chain validator must be present");
+        assert_eq!(
+            on_chain.staked, MIN_STAKE,
+            "on-chain stake must not be overwritten by committee fallback"
+        );
+        assert_eq!(on_chain.reputation, 750);
     }
 
     #[test]
@@ -978,7 +1408,8 @@ mod tests {
         &'static [u8],
     ) {
         use solidus_crypto::bbs::BbsSecretKey;
-        let sk = BbsSecretKey::from_ikm(b"rpc-bbs-test-ikm-must-be-at-least-32-bytes-long").expect("ikm");
+        let sk = BbsSecretKey::from_ikm(b"rpc-bbs-test-ikm-must-be-at-least-32-bytes-long")
+            .expect("ikm");
         let pk_bytes = sk.public_key().to_bytes();
         let messages: Vec<&[u8]> = vec![
             b"did:solidus:testnet:alice".as_ref(),
@@ -1047,9 +1478,18 @@ mod tests {
 
         // Lie about the country: claim FR instead of GB.
         let lied: Vec<RpcDisclosedMessage> = vec![
-            RpcDisclosedMessage { index: 0, message: hex::encode(messages[0]) },
-            RpcDisclosedMessage { index: 3, message: hex::encode(b"FR") },
-            RpcDisclosedMessage { index: 6, message: hex::encode(messages[6]) },
+            RpcDisclosedMessage {
+                index: 0,
+                message: hex::encode(messages[0]),
+            },
+            RpcDisclosedMessage {
+                index: 3,
+                message: hex::encode(b"FR"),
+            },
+            RpcDisclosedMessage {
+                index: 6,
+                message: hex::encode(messages[6]),
+            },
         ];
 
         let valid = SolidusApiServer::bbs_verify_proof(
@@ -1089,9 +1529,10 @@ mod tests {
         let (store, _dir) = open_tmp();
         let rpc = make_rpc(store);
 
-        let bogus = vec![
-            RpcDisclosedMessage { index: 99, message: hex::encode(b"hi") },
-        ];
+        let bogus = vec![RpcDisclosedMessage {
+            index: 99,
+            message: hex::encode(b"hi"),
+        }];
 
         let result = SolidusApiServer::bbs_verify_proof(
             &rpc,
@@ -1146,7 +1587,9 @@ mod tests {
             bbs_pubkey: None,
             bbs_message_count: None,
         };
-        store.put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes()).unwrap();
+        store
+            .put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes())
+            .unwrap();
 
         let rpc = make_rpc(store);
         let result = SolidusApiServer::bbs_verify_credential_proof(
@@ -1193,7 +1636,9 @@ mod tests {
             bbs_pubkey: Some(pk_bytes),
             bbs_message_count: Some(messages.len() as u32),
         };
-        store.put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes()).unwrap();
+        store
+            .put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes())
+            .unwrap();
 
         let rpc = make_rpc(store);
         let disclosed_messages: Vec<RpcDisclosedMessage> = disclosed_indices
@@ -1249,7 +1694,9 @@ mod tests {
             bbs_pubkey: Some(pk_bytes),
             bbs_message_count: Some(messages.len() as u32),
         };
-        store.put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes()).unwrap();
+        store
+            .put(CF_CREDENTIALS, cred.id.as_bytes(), &cred.to_bytes())
+            .unwrap();
 
         let rpc = make_rpc(store);
         let result = SolidusApiServer::bbs_verify_credential_proof(
@@ -1270,5 +1717,147 @@ mod tests {
         assert!(!result.valid, "valid=false because revoked");
         assert!(result.is_bbs);
         assert!(result.revoked);
+    }
+
+    #[test]
+    fn chain_info_default_metadata() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+
+        let info = rpc.chain_info().expect("chain_info should succeed");
+        assert_eq!(info.chain_id, "solidus-testnet");
+        assert_eq!(info.native_token.symbol, "TESTNET-SOLI");
+        assert_eq!(info.native_token.decimals, 8);
+        assert_eq!(info.latest_block, 0);
+        // No genesis block stored → falls back to the chain_id-derived hash
+        // (matches the node's genesis_hash = blake3(chain_id)). Never empty.
+        assert_eq!(
+            info.genesis_hash,
+            hex::encode(solidus_crypto::hash::blake3_hash(b"solidus-testnet")),
+        );
+        assert!(!info.genesis_hash.is_empty());
+        assert!(!info.version.is_empty());
+    }
+
+    #[test]
+    fn chain_info_surfaces_custom_metadata_and_genesis_hash() {
+        let (store, _dir) = open_tmp();
+
+        // Store a genesis block at height 0.
+        let block = Block {
+            header: BlockHeader {
+                height: 0,
+                round: 0,
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                transactions_root: [0u8; 32],
+                timestamp_ms: 1_700_000_000_000,
+                tx_count: 0,
+                proposer: Address::from_bytes([0u8; 20]),
+            },
+            transactions: vec![],
+            parent_qc: None,
+            vrf_proof: None,
+        };
+        let expected_hash = hex::encode(block.hash());
+        let data = serde_json::to_vec(&block).unwrap();
+        store.put(CF_BLOCKS, &0u64.to_le_bytes(), &data).unwrap();
+
+        let chain_meta = ChainMeta {
+            chain_id: "solidus-mainnet-1".to_string(),
+            native_token: RpcNativeToken {
+                symbol: "SLDS".to_string(),
+                name: "Solidus".to_string(),
+                decimals: 8,
+            },
+            version: "9.9.9".to_string(),
+        };
+        let rpc = SolidusRpcImpl::new(
+            store,
+            Arc::new(Mutex::new(Mempool::new())),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Vec::new()),
+            chain_meta,
+            None,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+
+        let info = rpc.chain_info().expect("chain_info should succeed");
+        assert_eq!(info.chain_id, "solidus-mainnet-1");
+        assert_eq!(info.native_token.symbol, "SLDS");
+        assert_eq!(info.version, "9.9.9");
+        assert_eq!(info.genesis_hash, expected_hash);
+    }
+
+    // -----------------------------------------------------------------------
+    // canonHead / getBlockBySeq
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a minimal Block for canon-index tests. Header values are
+    /// all zero except height + round, which the RPC layer surfaces.
+    fn dummy_block(height: u64, round: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                height,
+                round,
+                parent_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                transactions_root: [0u8; 32],
+                timestamp_ms: 0,
+                tx_count: 0,
+                proposer: Address::from_bytes([0u8; 20]),
+            },
+            transactions: vec![],
+            parent_qc: None,
+            vrf_proof: None,
+        }
+    }
+
+    #[test]
+    fn canon_head_returns_none_when_empty() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+        assert!(rpc.canon_head().unwrap().is_none());
+    }
+
+    #[test]
+    fn canon_head_returns_max_seq_and_hash() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(Arc::clone(&store));
+
+        let b0 = dummy_block(0, 0);
+        let b1 = dummy_block(1, 1);
+        solidus_consensus::ledger::put_block_by_hash(&store, &b0).unwrap();
+        solidus_consensus::ledger::put_block_by_hash(&store, &b1).unwrap();
+        solidus_consensus::ledger::canon_append(&store, 0, &b0.hash()).unwrap();
+        solidus_consensus::ledger::canon_append(&store, 1, &b1.hash()).unwrap();
+
+        let head = rpc.canon_head().unwrap().expect("head should be Some");
+        assert_eq!(head.seq, 1);
+        assert_eq!(head.hash, hex::encode(b1.hash()));
+    }
+
+    #[test]
+    fn get_block_by_seq_returns_block_at_canon_position() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(Arc::clone(&store));
+
+        let b0 = dummy_block(0, 0);
+        let b1 = dummy_block(1, 5); // intentionally mismatched height vs seq
+        solidus_consensus::ledger::put_block_by_hash(&store, &b0).unwrap();
+        solidus_consensus::ledger::put_block_by_hash(&store, &b1).unwrap();
+        solidus_consensus::ledger::canon_append(&store, 0, &b0.hash()).unwrap();
+        solidus_consensus::ledger::canon_append(&store, 1, &b1.hash()).unwrap();
+
+        let got = rpc.get_block_by_seq(1).unwrap().expect("seq 1 exists");
+        assert_eq!(got.hash, hex::encode(b1.hash()));
+        assert_eq!(got.round, 5);
+    }
+
+    #[test]
+    fn get_block_by_seq_returns_none_for_unknown_seq() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+        assert!(rpc.get_block_by_seq(999).unwrap().is_none());
     }
 }

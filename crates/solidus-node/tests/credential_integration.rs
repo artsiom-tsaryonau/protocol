@@ -15,9 +15,9 @@ use jsonrpsee::rpc_params;
 use solidus_consensus::mempool::Mempool;
 use solidus_crypto::ed25519::{generate_signing_key, sign};
 use solidus_crypto::keys::Address;
+use solidus_rpc::methods::ChainMeta;
 use solidus_rpc::server::start_rpc_server;
-use solidus_state::account::{Account, AccountType};
-use solidus_state::executor::{execute_block, save_account};
+use solidus_state::executor::execute_block;
 use solidus_state::store::Store;
 use solidus_txns::credential::CredentialType;
 use solidus_txns::did::build_did;
@@ -90,23 +90,15 @@ async fn issue_credential_and_verify_via_rpc() {
     let latest_height = Arc::new(Mutex::new(0u64));
 
     // -----------------------------------------------------------------------
-    // 2. Fund two accounts (issuer and subject)
+    // 2. Generate issuer + subject keys — both become pristine DID anchors
+    //    (no funding; DID + credential ops are fee-exempt in the value-decoupled
+    //    model).
     // -----------------------------------------------------------------------
     let issuer_key = generate_signing_key();
     let subject_key = generate_signing_key();
 
     let issuer_addr = Address::from_public_key(&issuer_key.verifying_key());
     let subject_addr = Address::from_public_key(&subject_key.verifying_key());
-
-    {
-        // Issuer needs: DID create fee (100_000) + Email credential fee (1_000_000)
-        let issuer_account = Account::with_balance(issuer_addr, 10_000_000, AccountType::Regular);
-        save_account(&store, &issuer_account).expect("fund issuer failed");
-
-        // Subject needs: DID create fee (100_000)
-        let subject_account = Account::with_balance(subject_addr, 1_000_000, AccountType::Regular);
-        save_account(&store, &subject_account).expect("fund subject failed");
-    }
 
     let treasury_addr = Address::from_bytes([0xAA; 20]);
     let validator_addr = Address::from_bytes([0xBB; 20]);
@@ -120,6 +112,10 @@ async fn issue_credential_and_verify_via_rpc() {
         Arc::clone(&store),
         Arc::clone(&mempool),
         Arc::clone(&latest_height),
+        Arc::new(Vec::new()),
+        ChainMeta::default(),
+        None,
+        std::sync::Arc::new(tokio::sync::Notify::new()),
     )
     .await
     .expect("failed to start RPC server");
@@ -130,8 +126,16 @@ async fn issue_credential_and_verify_via_rpc() {
     // 4. Create issuer DID (block 1)
     // -----------------------------------------------------------------------
     let tx_issuer_did = make_did_create_tx(&issuer_key, 0);
-    let receipts = execute_block(&store, &[tx_issuer_did], 1, &treasury_addr, &[validator_addr], "testnet")
-        .expect("issuer DidCreate execute_block failed");
+    let receipts = execute_block(
+        &store,
+        &[tx_issuer_did],
+        1,
+        1_700_000_000_000,
+        &treasury_addr,
+        &[validator_addr],
+        "testnet",
+    )
+    .expect("issuer DidCreate execute_block failed");
     assert_eq!(receipts.len(), 1);
     assert_eq!(
         receipts[0].status,
@@ -145,8 +149,16 @@ async fn issue_credential_and_verify_via_rpc() {
     // 5. Create subject DID (block 2)
     // -----------------------------------------------------------------------
     let tx_subject_did = make_did_create_tx(&subject_key, 0);
-    let receipts = execute_block(&store, &[tx_subject_did], 2, &treasury_addr, &[validator_addr], "testnet")
-        .expect("subject DidCreate execute_block failed");
+    let receipts = execute_block(
+        &store,
+        &[tx_subject_did],
+        2,
+        1_700_000_000_000,
+        &treasury_addr,
+        &[validator_addr],
+        "testnet",
+    )
+    .expect("subject DidCreate execute_block failed");
     assert_eq!(receipts.len(), 1);
     assert_eq!(
         receipts[0].status,
@@ -171,8 +183,16 @@ async fn issue_credential_and_verify_via_rpc() {
         1, // issuer nonce=1 (after DidCreate)
     );
 
-    let receipts = execute_block(&store, &[tx_issue], 3, &treasury_addr, &[validator_addr], "testnet")
-        .expect("CredentialIssue execute_block failed");
+    let receipts = execute_block(
+        &store,
+        &[tx_issue],
+        3,
+        1_700_000_000_000,
+        &treasury_addr,
+        &[validator_addr],
+        "testnet",
+    )
+    .expect("CredentialIssue execute_block failed");
     assert_eq!(receipts.len(), 1);
     assert_eq!(
         receipts[0].status,
@@ -197,7 +217,10 @@ async fn issue_credential_and_verify_via_rpc() {
         .expect("failed to build HTTP client");
 
     let verify_result: Option<serde_json::Value> = client
-        .request("solidus_credentialVerify", rpc_params![credential_id.clone()])
+        .request(
+            "solidus_credentialVerify",
+            rpc_params![credential_id.clone()],
+        )
         .await
         .expect("solidus_credentialVerify failed");
 
@@ -207,15 +230,27 @@ async fn issue_credential_and_verify_via_rpc() {
 
     let rpc_cred = &verify["credential"];
     assert_eq!(rpc_cred["id"], credential_id, "credential id should match");
-    assert_eq!(rpc_cred["issuer_did"], issuer_did, "issuer_did should match");
-    assert_eq!(rpc_cred["subject_did"], subject_did, "subject_did should match");
-    assert_eq!(rpc_cred["credential_type"], "Email", "credential_type should be Email");
+    assert_eq!(
+        rpc_cred["issuer_did"], issuer_did,
+        "issuer_did should match"
+    );
+    assert_eq!(
+        rpc_cred["subject_did"], subject_did,
+        "subject_did should match"
+    );
+    assert_eq!(
+        rpc_cred["credential_type"], "Email",
+        "credential_type should be Email"
+    );
 
     // -----------------------------------------------------------------------
     // 8. Query via RPC solidus_credentialsBySubject
     // -----------------------------------------------------------------------
     let by_subject_result: Vec<serde_json::Value> = client
-        .request("solidus_credentialsBySubject", rpc_params![subject_did.clone()])
+        .request(
+            "solidus_credentialsBySubject",
+            rpc_params![subject_did.clone()],
+        )
         .await
         .expect("solidus_credentialsBySubject failed");
 
@@ -224,14 +259,23 @@ async fn issue_credential_and_verify_via_rpc() {
         1,
         "should have exactly one credential for this subject"
     );
-    assert_eq!(by_subject_result[0]["id"], credential_id, "credential id should match");
-    assert_eq!(by_subject_result[0]["revoked"], false, "credential should not be revoked");
+    assert_eq!(
+        by_subject_result[0]["id"], credential_id,
+        "credential id should match"
+    );
+    assert_eq!(
+        by_subject_result[0]["revoked"], false,
+        "credential should not be revoked"
+    );
 
     // -----------------------------------------------------------------------
     // 9. Query via RPC solidus_credentialsByIssuer
     // -----------------------------------------------------------------------
     let by_issuer_result: Vec<serde_json::Value> = client
-        .request("solidus_credentialsByIssuer", rpc_params![issuer_did.clone()])
+        .request(
+            "solidus_credentialsByIssuer",
+            rpc_params![issuer_did.clone()],
+        )
         .await
         .expect("solidus_credentialsByIssuer failed");
 
@@ -240,7 +284,10 @@ async fn issue_credential_and_verify_via_rpc() {
         1,
         "should have exactly one credential for this issuer"
     );
-    assert_eq!(by_issuer_result[0]["id"], credential_id, "credential id should match");
+    assert_eq!(
+        by_issuer_result[0]["id"], credential_id,
+        "credential id should match"
+    );
 
     // -----------------------------------------------------------------------
     // 10. Stop RPC server

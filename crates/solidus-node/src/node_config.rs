@@ -11,6 +11,15 @@ pub struct MultiNodeConfig {
     pub node: NodeSection,
     #[serde(default)]
     pub peers: Vec<PeerSection>,
+    /// Optional Kademlia bootstrap peers (multiaddrs ending in `/p2p/<peerid>`).
+    /// Additive: a node with an empty list behaves exactly as before (static
+    /// peers only). Parsed into dialable (PeerId, Multiaddr) pairs at startup.
+    ///
+    /// TOML placement: because this is a top-level bare key (not a table), it
+    /// MUST appear **before** the `[node]` header in the config file, otherwise
+    /// TOML parses it as `node.bootstrap_peers` and it is silently ignored.
+    #[serde(default)]
+    pub bootstrap_peers: Vec<String>,
 }
 
 /// The `[node]` section of a multi-node config.
@@ -30,20 +39,36 @@ pub struct NodeSection {
     pub bls_key: PathBuf,
     /// TCP port for the JSON-RPC server.
     pub rpc_port: u16,
+    /// IP address the JSON-RPC server binds to.
+    ///
+    /// Default `"127.0.0.1"` keeps RPC reachable only from localhost — the
+    /// secure default. Setting `"0.0.0.0"` exposes RPC publicly; the server
+    /// has no authentication, so do this ONLY behind a reverse proxy (nginx,
+    /// Cloudflare) that enforces TLS + access controls. Multi-host deployments
+    /// (separate machine for solidus-node vs RPC consumers) require this.
+    #[serde(default = "default_rpc_listen")]
+    pub rpc_listen: String,
     /// This validator's zero-based index in the committee.
+    ///
+    /// For a full node (`full_node = true`) this field is kept for config
+    /// uniformity but never used to index the committee — the follower path
+    /// never proposes, so it never reaches `validators[node_index]`.
     pub node_index: usize,
+    /// Run as a non-validating full node (C2): discover the network from
+    /// `bootstrap_peers`, sync the canon by libp2p PeerId, serve RPC, and never
+    /// propose/vote. Additive: absent → `false`, i.e. a validator (back-compat).
+    #[serde(default)]
+    pub full_node: bool,
 }
 
 /// A `[[peers]]` entry describing a known validator peer.
-///
-/// Fields are read during deserialization and will be consumed when wiring up
-/// the libp2p transport in production mode.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct PeerSection {
     /// The peer's zero-based index in the committee.
     pub index: usize,
-    /// The peer's address (e.g. `"127.0.0.1:30301"`).
+    /// The peer's libp2p PeerId (base58), e.g. `"12D3Koo..."`.
+    pub peer_id: String,
+    /// The peer's libp2p multiaddr, e.g. `"/ip4/127.0.0.1/tcp/30301"`.
     pub address: String,
 }
 
@@ -53,6 +78,11 @@ impl MultiNodeConfig {
         let content = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&content)?)
     }
+}
+
+/// Default `rpc_listen` — localhost only. Public exposure requires opt-in.
+fn default_rpc_listen() -> String {
+    "127.0.0.1".to_string()
 }
 
 #[cfg(test)]
@@ -78,7 +108,29 @@ node_index = 0
         assert_eq!(cfg.node.listen_port, 30300);
         assert_eq!(cfg.node.node_index, 0);
         assert_eq!(cfg.node.rpc_port, 8080);
+        // rpc_listen defaults to 127.0.0.1 when absent — back-compat with
+        // configs written before this field existed.
+        assert_eq!(cfg.node.rpc_listen, "127.0.0.1");
         assert!(cfg.peers.is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_rpc_listen_explicit() {
+        let toml_str = r#"
+[node]
+chain_id = "solidus-testnet-1"
+listen_port = 30300
+data_dir = "./data"
+genesis = "../genesis.json"
+ed25519_key = "node.key"
+bls_key = "bls.key"
+rpc_port = 9944
+rpc_listen = "0.0.0.0"
+node_index = 0
+"#;
+
+        let cfg: MultiNodeConfig = toml::from_str(toml_str).expect("parse failed");
+        assert_eq!(cfg.node.rpc_listen, "0.0.0.0");
     }
 
     #[test]
@@ -96,21 +148,103 @@ node_index = 0
 
 [[peers]]
 index = 1
-address = "127.0.0.1:30301"
+peer_id = "12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X"
+address = "/ip4/127.0.0.1/tcp/30301"
 
 [[peers]]
 index = 2
-address = "127.0.0.1:30302"
-
-[[peers]]
-index = 3
-address = "127.0.0.1:30303"
+peer_id = "12D3KooWH3uVF6wv47WnArKHk5p6cvgCJEb74UTmxztmQDc298L3"
+address = "/ip4/127.0.0.1/tcp/30302"
 "#;
 
         let cfg: MultiNodeConfig = toml::from_str(toml_str).expect("parse failed");
-        assert_eq!(cfg.peers.len(), 3);
+        assert_eq!(cfg.peers.len(), 2);
         assert_eq!(cfg.peers[0].index, 1);
-        assert_eq!(cfg.peers[0].address, "127.0.0.1:30301");
-        assert_eq!(cfg.peers[2].index, 3);
+        assert_eq!(
+            cfg.peers[0].peer_id,
+            "12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X"
+        );
+        assert_eq!(cfg.peers[0].address, "/ip4/127.0.0.1/tcp/30301");
+        assert_eq!(cfg.peers[1].index, 2);
+    }
+
+    #[test]
+    fn parse_config_with_bootstrap_peers() {
+        // NOTE: top-level `bootstrap_peers` MUST precede the `[node]` header —
+        // a bare key after a table header is parsed into that table (TOML rule).
+        let toml_str = r#"
+bootstrap_peers = [
+  "/ip4/1.2.3.4/tcp/30300/p2p/12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X",
+]
+
+[node]
+chain_id = "solidus-testnet-1"
+listen_port = 30300
+data_dir = "./data"
+genesis = "../genesis.json"
+ed25519_key = "node.key"
+bls_key = "bls.key"
+rpc_port = 8080
+node_index = 0
+"#;
+        let cfg: MultiNodeConfig = toml::from_str(toml_str).expect("parse failed");
+        assert_eq!(cfg.bootstrap_peers.len(), 1);
+        assert!(cfg.bootstrap_peers[0].ends_with("Nft9HyQ6X"));
+    }
+
+    #[test]
+    fn parse_config_with_full_node_flag() {
+        let toml_str = r#"
+[node]
+chain_id = "solidus-testnet-1"
+listen_port = 30310
+data_dir = "./data"
+genesis = "../genesis.json"
+ed25519_key = "node.key"
+bls_key = "bls.key"
+rpc_port = 8090
+node_index = 0
+full_node = true
+"#;
+        let cfg: MultiNodeConfig = toml::from_str(toml_str).expect("parse failed");
+        assert!(cfg.node.full_node, "full_node should parse as true");
+    }
+
+    #[test]
+    fn config_without_full_node_defaults_false() {
+        // Back-compat: existing validator configs omit `full_node` entirely.
+        let toml_str = r#"
+[node]
+chain_id = "solidus-testnet-1"
+listen_port = 30300
+data_dir = "./data"
+genesis = "../genesis.json"
+ed25519_key = "node.key"
+bls_key = "bls.key"
+rpc_port = 8080
+node_index = 0
+"#;
+        let cfg: MultiNodeConfig = toml::from_str(toml_str).expect("parse failed");
+        assert!(
+            !cfg.node.full_node,
+            "full_node should default to false when absent"
+        );
+    }
+
+    #[test]
+    fn config_without_bootstrap_peers_defaults_empty() {
+        let toml_str = r#"
+[node]
+chain_id = "solidus-testnet-1"
+listen_port = 30300
+data_dir = "./data"
+genesis = "../genesis.json"
+ed25519_key = "node.key"
+bls_key = "bls.key"
+rpc_port = 8080
+node_index = 0
+"#;
+        let cfg: MultiNodeConfig = toml::from_str(toml_str).expect("parse failed");
+        assert!(cfg.bootstrap_peers.is_empty());
     }
 }

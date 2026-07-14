@@ -6,11 +6,11 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidatorInfo {
     pub address: Address,
-    pub staked: u64,                    // currently staked amount
-    pub unbonding: u64,                 // amount being unstaked (21-day lock)
+    pub staked: u64,                     // currently staked amount
+    pub unbonding: u64,                  // amount being unstaked (21-day lock)
     pub unbonding_start_ms: Option<u64>, // when unbonding started
-    pub reputation: u64,                // 0-1000
-    pub active: bool,                   // whether participating in consensus
+    pub reputation: u64,                 // 0-1000
+    pub active: bool,                    // whether participating in consensus
 }
 
 impl ValidatorInfo {
@@ -23,8 +23,8 @@ impl ValidatorInfo {
     }
 }
 
-/// Minimum stake to become a validator (1000 SOLID = 100_000_000_000).
-pub const MIN_STAKE: u64 = 100_000_000_000;
+/// Minimum stake to become a validator (10,000 SLDS = 1_000_000_000_000).
+pub const MIN_STAKE: u64 = 1_000_000_000_000;
 
 /// Unbonding period in milliseconds (21 days).
 pub const UNBONDING_PERIOD_MS: u64 = 21 * 24 * 60 * 60 * 1000;
@@ -179,8 +179,8 @@ mod tests {
     // 4. ZeroAmount error
     #[test]
     fn stake_zero_amount() {
-        let err = execute_stake(&addr(), 0, MIN_STAKE, None, 0)
-            .expect_err("should fail with ZeroAmount");
+        let err =
+            execute_stake(&addr(), 0, MIN_STAKE, None, 0).expect_err("should fail with ZeroAmount");
         assert_eq!(err, StakingError::ZeroAmount);
     }
 
@@ -207,8 +207,8 @@ mod tests {
     fn unstake_success_full() {
         let existing = make_validator(MIN_STAKE);
         let ts = 1_000_000u64;
-        let result = execute_unstake(MIN_STAKE, Some(&existing), ts)
-            .expect("unstake should succeed");
+        let result =
+            execute_unstake(MIN_STAKE, Some(&existing), ts).expect("unstake should succeed");
         assert_eq!(result.staked, 0);
         assert!(!result.active);
         assert_eq!(result.unbonding, MIN_STAKE);

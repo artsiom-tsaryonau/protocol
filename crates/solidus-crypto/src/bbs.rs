@@ -77,8 +77,8 @@ impl BbsSecretKey {
     pub fn generate() -> Result<Self, BbsError> {
         let mut ikm = [0u8; 64];
         rand::thread_rng().fill_bytes(&mut ikm);
-        let kp = KeyPair::<BbsScheme>::generate(&ikm, None, None)
-            .map_err(|_| BbsError::KeyGenFailed)?;
+        let kp =
+            KeyPair::<BbsScheme>::generate(&ikm, None, None).map_err(|_| BbsError::KeyGenFailed)?;
         let (sk, _pk) = kp.into_parts();
         Ok(Self(sk))
     }
@@ -86,8 +86,8 @@ impl BbsSecretKey {
     /// Generate a BBS+ keypair deterministically from an input key material.
     /// Useful for test vectors and reproducible derivations.
     pub fn from_ikm(ikm: &[u8]) -> Result<Self, BbsError> {
-        let kp = KeyPair::<BbsScheme>::generate(ikm, None, None)
-            .map_err(|_| BbsError::KeyGenFailed)?;
+        let kp =
+            KeyPair::<BbsScheme>::generate(ikm, None, None).map_err(|_| BbsError::KeyGenFailed)?;
         let (sk, _pk) = kp.into_parts();
         Ok(Self(sk))
     }
@@ -102,13 +102,8 @@ impl BbsSecretKey {
     pub fn sign(&self, header: &[u8], messages: &[&[u8]]) -> Result<BbsSignature, BbsError> {
         let owned: Vec<Vec<u8>> = messages.iter().map(|m| m.to_vec()).collect();
         let pk = self.0.public_key();
-        let sig = Signature::<BbsScheme>::sign(
-            Some(&owned),
-            &self.0,
-            &pk,
-            Some(header),
-        )
-        .map_err(|e| BbsError::Internal(format!("sign failed: {e:?}")))?;
+        let sig = Signature::<BbsScheme>::sign(Some(&owned), &self.0, &pk, Some(header))
+            .map_err(|e| BbsError::Internal(format!("sign failed: {e:?}")))?;
         Ok(BbsSignature(sig))
     }
 
@@ -372,7 +367,7 @@ impl BbsProof {
     /// bytes (3×G1 + 3×Scalar) plus a multiple of 32 for hidden-message scalars.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BbsError> {
         const MIN_PROOF_BYTES: usize = 240;
-        if bytes.len() < MIN_PROOF_BYTES || (bytes.len() - MIN_PROOF_BYTES) % 32 != 0 {
+        if bytes.len() < MIN_PROOF_BYTES || !(bytes.len() - MIN_PROOF_BYTES).is_multiple_of(32) {
             return Err(BbsError::InvalidProof);
         }
         PoKSignature::<BbsScheme>::from_bytes(bytes)
@@ -572,15 +567,27 @@ mod tests {
     #[test]
     fn proof_from_bytes_rejects_short_input() {
         // 0 bytes — too short.
-        assert_eq!(BbsProof::from_bytes(&[]).unwrap_err(), BbsError::InvalidProof);
+        assert_eq!(
+            BbsProof::from_bytes(&[]).unwrap_err(),
+            BbsError::InvalidProof
+        );
         // 100 bytes — still too short (need ≥240).
         let short = vec![0u8; 100];
-        assert_eq!(BbsProof::from_bytes(&short).unwrap_err(), BbsError::InvalidProof);
+        assert_eq!(
+            BbsProof::from_bytes(&short).unwrap_err(),
+            BbsError::InvalidProof
+        );
         // 241 bytes — wrong tail alignment (240 + 1 not multiple of 32).
         let misaligned = vec![0u8; 241];
-        assert_eq!(BbsProof::from_bytes(&misaligned).unwrap_err(), BbsError::InvalidProof);
+        assert_eq!(
+            BbsProof::from_bytes(&misaligned).unwrap_err(),
+            BbsError::InvalidProof
+        );
         // 1 byte — earlier zkryptium 0.6.1 would panic here without our guard.
-        assert_eq!(BbsProof::from_bytes(&[0x00]).unwrap_err(), BbsError::InvalidProof);
+        assert_eq!(
+            BbsProof::from_bytes(&[0x00]).unwrap_err(),
+            BbsError::InvalidProof
+        );
     }
 
     #[test]
