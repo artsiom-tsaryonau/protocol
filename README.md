@@ -133,10 +133,10 @@ curl -s -X POST http://127.0.0.1:9944 \
 
 - [`@solidus-network/sdk`](https://github.com/solidusnetwork/sdk) — TypeScript SDK
   with DID, credential, BBS+ and SD-JWT VC primitives
-- [`solidus-verify`](https://github.com/solidusnetwork/verify) — production KYC
-  service issuing BBS+ credentials
-- [`solidus-identity`](https://github.com/solidusnetwork/identity) — self-sovereign
-  identity wallet, credential holder, OIDC bridge
+- [Solidus Verify](https://verify.solidus.network) — production KYC service issuing
+  BBS+ credentials (source not public)
+- [Solidus Identity](https://identity.solidus.network) — self-sovereign identity
+  wallet, credential holder, OIDC bridge (source not public)
 
 ## License
 
