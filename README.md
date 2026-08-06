@@ -85,8 +85,17 @@ Design docs: [`docs/v2-execution-model.md`](docs/v2-execution-model.md) ·
 
 ## Status
 
-v1: live on **testnet** with four validators, single-block finality, ~35 k blocks/15 s
-under load. Mainnet launch is gated on independent security audit.
+v1: live on **testnet**, still producing blocks. The committee is whatever
+`solidus_getValidators` returns — this page does not restate a count, because one typed here is
+wrong the next time the set changes.
+
+⚠ **The testnet is currently idle**, emitting an empty heartbeat block roughly every 10 minutes
+(`tx_count: 0`). Do not read its current block rate as throughput. During its productive period it
+sustained about **1 block/second** (measured from on-chain `timestamp_ms` over 20 000 consecutive
+canonical blocks: 0.98 s/block, then 1.25 s/block), which is where the ~1–2 s finality figure above
+comes from. Re-measure it yourself with `solidus_getBlockBySeq` rather than trusting this paragraph.
+
+Mainnet launch is gated on independent security audit.
 
 v2: code, benchmark harness, and local-devnet tooling are public in this repo as of
 2026-07-14. No public v2 network exists yet; a mainnet-*candidate* is not a mainnet.
@@ -97,27 +106,37 @@ v2: code, benchmark harness, and local-devnet tooling are public in this repo as
 cargo build --release
 ```
 
-## Run a single-node devnet
+## Run a local devnet
+
+`solidus-node` is subcommand-driven. Generate a genesis + validator set, then run them:
 
 ```bash
-target/release/solidus-node \
-  --chain-id solidus-devnet-1 \
-  --data-dir ./dev-data \
-  --rpc-listen 127.0.0.1:9944
+# genesis.json, validator-N/ dirs and keys under ./testnet
+target/release/solidus-node genesis \
+  --validators 4 \
+  --output ./testnet \
+  --chain-id solidus-devnet-1
+
+# all validators in one process, RPC on 127.0.0.1:9944
+target/release/solidus-node dev-testnet \
+  --testnet-dir ./testnet \
+  --rpc-port 9944
 ```
 
-Then resolve a sample DID:
+`solidus-node run --config config.toml` starts a single node against an existing config;
+`--help` lists the rest (`peer-id`, `canon-dump`, `sign-transfer`).
+
+Confirm it is alive:
 
 ```bash
 curl -s -X POST http://127.0.0.1:9944 \
   -H 'Content-Type: application/json' \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "solidus_didResolve",
-    "params": ["did:solidus:testnet:5dXc8vN3kzGm7p6L9HsQrR2hYfBaT1Wj"]
-  }'
+  -d '{"jsonrpc":"2.0","id":1,"method":"solidus_chainInfo","params":[]}'
 ```
+
+A freshly generated chain contains **no DIDs**, so `solidus_didResolve` returns `null` on it
+until you create one — issue a DID with [`@solidus-network/sdk`](https://www.npmjs.com/package/@solidus-network/sdk)
+(`did.create`) and resolve that. Against the public testnet, resolve any DID that exists there.
 
 ## Shipped features
 
