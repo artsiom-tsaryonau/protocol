@@ -72,8 +72,12 @@ crates/
   state-sync yet, so mid-flight join and restart-recovery are named open work items.
 - **No token.** There is no $SLDS or any other token; nothing here mints, promises,
   or redeems value.
-- `did:solidus` is submitted to the W3C DID method registry and **under review** —
-  not yet registered. (Solidus is a DIF Associate Member.)
+- `did:solidus` is **registered** in the W3C DID Method Registry — PR
+  [w3c/did-extensions#713](https://github.com/w3c/did-extensions/pull/713) merged 2026-07-04,
+  listed at [w3.org/TR/did-extensions-methods](https://www.w3.org/TR/did-extensions-methods/).
+  Registration records that a method exists and is documented; it is **not** a W3C endorsement,
+  and it says nothing about whether this implementation is secure. (Solidus is a DIF Associate
+  Member.)
 
 Design docs: [`docs/v2-execution-model.md`](docs/v2-execution-model.md) ·
 [`docs/v2-consensus.md`](docs/v2-consensus.md) ·
