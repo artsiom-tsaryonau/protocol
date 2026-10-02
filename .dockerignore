@@ -1,0 +1,7 @@
+target/
+.git/
+**/node_modules/
+testnet/
+dev-data/
+data/
+*.key

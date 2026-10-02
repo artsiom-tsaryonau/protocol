@@ -134,6 +134,24 @@ enum Commands {
 // main
 // ---------------------------------------------------------------------------
 
+/// Resolve on Ctrl+C (SIGINT) or, on Unix, SIGTERM — the signal container runtimes
+/// (Docker, Kubernetes) send on stop. Without it a pod is SIGKILLed after the grace
+/// period and RocksDB never sees a clean shutdown.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Init tracing
@@ -304,8 +322,8 @@ async fn run_node(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("solidus-node running — press Ctrl+C to stop");
 
-    // 8. Wait for Ctrl+C
-    tokio::signal::ctrl_c().await?;
+    // 8. Wait for Ctrl+C or SIGTERM
+    shutdown_signal().await?;
     info!("shutdown signal received");
 
     // 9. Send shutdown signal, await proposer, stop RPC
@@ -573,8 +591,8 @@ async fn run_consensus_node(config_path: &str) -> Result<(), Box<dyn Error>> {
         "solidus-node (HotStuff consensus) running — press Ctrl+C to stop"
     );
 
-    // 13. Wait for Ctrl+C
-    tokio::signal::ctrl_c().await?;
+    // 13. Wait for Ctrl+C or SIGTERM
+    shutdown_signal().await?;
     info!("shutdown signal received");
 
     // 14. Send shutdown signal, await consensus loop, stop RPC
@@ -805,7 +823,7 @@ async fn run_full_node(config_path: &str) -> Result<(), Box<dyn Error>> {
 
     info!("solidus-node (full node) running — press Ctrl+C to stop");
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await?;
     info!("shutdown signal received");
     if let Err(e) = shutdown_tx.send(true) {
         error!(error = %e, "failed to send shutdown signal");
@@ -1530,8 +1548,8 @@ async fn run_dev_testnet(
     .map_err(|e| -> Box<dyn Error> { e })?;
     info!(%actual_rpc_addr, "RPC server started");
 
-    // 10. Wait for Ctrl+C
-    tokio::signal::ctrl_c().await?;
+    // 10. Wait for Ctrl+C or SIGTERM
+    shutdown_signal().await?;
     info!("shutdown signal received");
     let _ = shutdown_tx.send(true);
 
