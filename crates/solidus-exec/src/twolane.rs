@@ -39,6 +39,9 @@ pub fn execute_block_twolane<R: StateReader + Sync + ?Sized>(
     ctx: &BlockCtx<'_>,
     opts: &ExecOptions,
 ) -> Result<BlockOutcome, ExecError> {
+    // ⛔ The wire is a function of HEIGHT, not of config: at a V2 height a
+    // BinaryV2 base becomes BinaryV3 bound to this chain id.
+    let wire = crate::wire::wire_for_height(opts.wire, opts.chain_id, ctx.height);
     if opts.order == ExecOrder::RawBlock {
         return Err(ExecError::StateRead(
             "two-lane executor only implements LanePartitioned order".to_string(),
@@ -48,7 +51,7 @@ pub fn execute_block_twolane<R: StateReader + Sync + ?Sized>(
     // ---- 1. Parallel signature pre-pass (lane-agnostic, §5.3) ----------
     let valid: Vec<bool> = txs
         .par_iter()
-        .map(|tx| wire::verify_signature(tx, opts.wire))
+        .map(|tx| wire::verify_signature(tx, wire))
         .collect();
 
     // ---- 2. Deterministic lane partition (Hazard-A) --------------------
@@ -69,13 +72,21 @@ pub fn execute_block_twolane<R: StateReader + Sync + ?Sized>(
     // signature gate exits before any state access).
     for &i in &plan.invalid {
         let mut view = SerialView::new(&mut delta, baseline, &mut fees);
-        receipts[i] = Some(handlers::run_tx(&mut view, &txs[i], ctx, opts.wire)?);
+        receipts[i] = Some(handlers::run_tx(&mut view, &txs[i], ctx, wire)?);
     }
 
     // ---- 4. Identity / serial lane (FIRST — Hazard-B ordering) ---------
     for &i in &plan.identity {
         let mut view = SerialView::new(&mut delta, baseline, &mut fees);
-        receipts[i] = Some(handlers::run_tx(&mut view, &txs[i], ctx, opts.wire)?);
+        receipts[i] = Some(handlers::run_tx(&mut view, &txs[i], ctx, wire)?);
+    }
+
+    // ---- 4b. Bridge block-end step (V2). Serial and before the freeze: it
+    //          writes only bridge keys, which the payment lane never touches.
+    let mut block_events = Vec::new();
+    if ctx.protocol_version() >= crate::protocol::ProtocolVersion::V2 {
+        let mut view = SerialView::new(&mut delta, baseline, &mut fees);
+        block_events = crate::bridge::on_block_end(&mut view, ctx)?;
     }
 
     // ---- 5. Freeze: the identity delta becomes the immutable payment
@@ -83,7 +94,7 @@ pub fn execute_block_twolane<R: StateReader + Sync + ?Sized>(
     delta.freeze();
 
     // ---- 6. Payment lane: parallel wave-OCC over Transfer only ---------
-    let payment = run_payment_lane(baseline, &delta, txs, &plan.payment, ctx, opts.wire)?;
+    let payment = run_payment_lane(baseline, &delta, txs, &plan.payment, ctx, wire)?;
     for (i, receipt) in payment.receipts {
         receipts[i] = Some(receipt);
     }
@@ -105,7 +116,7 @@ pub fn execute_block_twolane<R: StateReader + Sync + ?Sized>(
             debug_assert!(r.is_some(), "lane plan must cover every tx index");
             r.unwrap_or_else(|| {
                 handlers::failed_receipt(
-                    wire::tx_hash(&txs[i], opts.wire),
+                    wire::tx_hash(&txs[i], wire),
                     ctx.height,
                     0,
                     "internal: tx not covered by lane plan".to_string(),
@@ -114,5 +125,9 @@ pub fn execute_block_twolane<R: StateReader + Sync + ?Sized>(
         })
         .collect();
 
-    Ok(BlockOutcome { receipts, delta })
+    Ok(BlockOutcome {
+        receipts,
+        delta,
+        block_events,
+    })
 }

@@ -3,6 +3,29 @@ name = "solidus-crypto"
 version.workspace = true
 edition.workspace = true
 
+# Gated so a DID resolver does not build a C library it never calls.
+#
+# `bls` is 320 lines used only by consensus and node crates, and it is the ONLY
+# path to `blst` — a C dependency every downstream consumer would otherwise
+# compile. `vrf` is grouped with it: no extra dependency, but node-side surface.
+#
+# `bbs` sits behind its own flag because `zkryptium` is heavy and a client that
+# only resolves DIDs never verifies a credential.
+#
+# Decided 2026-08-07 (Rust SDK design decision "R2").
+[features]
+default = ["ed25519", "hash", "keys"]
+ed25519 = []
+hash = []
+keys = ["ed25519", "hash"]     # keys::Address derives from both
+bbs = ["dep:zkryptium"]
+consensus = ["dep:blst"]       # bls + vrf
+# ⚠ GATED FOR THE SAME REASON AS THE OTHERS, NOT A DIFFERENT ONE. The plan said to add `k256`
+# plainly, and that would reach `solidus-client`, whose own comment pins it to "default features
+# only: hash + keys + ed25519". secp256k1 is only ever wanted by the bridge, so it is opt-in and
+# `solidus-exec` and `solidus-noded` ask for it by name.
+attest = ["dep:k256", "dep:sha3"]
+
 [dependencies]
 ed25519-dalek.workspace = true
 blake3.workspace = true
@@ -11,9 +34,27 @@ serde.workspace = true
 bs58.workspace = true
 hex.workspace = true
 thiserror.workspace = true
-blst.workspace = true
+blst = { workspace = true, optional = true }
 sha2.workspace = true
-zkryptium.workspace = true
+zkryptium = { workspace = true, optional = true }
+k256 = { version = "0.13", features = ["ecdsa"], optional = true }
+# keccak256 for the Ethereum address derivation. NOT re-exported: `solidus-bridge-codec` already
+# owns the public one, and a second public keccak256 in the estate is a second thing to keep in
+# step for no gain. This one is private to `attest.rs`.
+sha3 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
+blst = { workspace = true }
+
+[[test]]
+name = "attest"
+required-features = ["attest"]
+
+[[test]]
+name = "bls_pop"
+required-features = ["consensus"]
+
+[[test]]
+name = "bls_rogue_key"
+required-features = ["consensus"]

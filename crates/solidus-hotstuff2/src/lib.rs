@@ -27,12 +27,14 @@ pub mod core;
 pub mod error;
 pub mod leader;
 pub mod pacemaker;
+pub mod params;
 pub mod safety;
 pub mod slashing;
 pub mod types;
 
 pub use crate::core::{
-    Action, CommittedBlock, ConsensusCore, CoreConfig, EmptyPayloads, PayloadProvider,
+    Action, CommittedBlock, ConsensusCore, CoreConfig, EmptyPayloads, PayloadProvider, ResumeState,
+    MIN_TIMEOUT_HEADROOM,
 };
 pub use error::ConsensusError;
 pub use leader::{LeaderElector, RoundRobin};

@@ -199,7 +199,11 @@ async fn leader_failure_triggers_timeout() {
 
     // Simulate leader not proposing: skip the proposal phase entirely.
     // All 4 nodes create timeout votes for the current round.
-    let timeout_msg = round.to_le_bytes();
+    // The bytes the node actually signs. This test used `round.to_le_bytes()`
+    // -- a different message from the one production signs -- and nothing
+    // caught it for as long as the file has existed, because until 2026-08-24
+    // nothing verified a timeout vote at all.
+    let timeout_msg = TimeoutVote::signing_bytes(round);
 
     let tv0 = TimeoutVote {
         round,

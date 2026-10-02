@@ -70,6 +70,21 @@ impl StateForest {
         self.tree(id).root()
     }
 
+    /// The stored value at `key` in sub-tree `id`, if any.
+    pub fn get(&self, id: TreeId, key: &[u8]) -> Option<&[u8]> {
+        self.tree(id).get(key)
+    }
+
+    /// The four sub-tree roots in combine order: accounts, dids, credentials, validators.
+    pub fn sub_roots(&self) -> [[u8; 32]; 4] {
+        [
+            self.accounts.root(),
+            self.dids.root(),
+            self.credentials.root(),
+            self.validators.root(),
+        ]
+    }
+
     /// Inclusion proof for `key` in sub-tree `id` (precompile path).
     pub fn prove(&self, id: TreeId, key: &[u8]) -> Option<crate::proof::InclusionProof> {
         self.tree(id).prove(key)
@@ -118,5 +133,22 @@ mod tests {
         base.apply(TreeId::Validators, b"v", b"1");
         let r1 = base.global_root();
         assert_ne!(r0, r1);
+    }
+
+    #[test]
+    fn get_reads_a_leaf_and_sub_roots_are_in_tree_order() {
+        let mut forest = StateForest::new();
+        forest.apply(TreeId::Credentials, b"bridge:seq:x", b"v");
+        assert_eq!(
+            forest.get(TreeId::Credentials, b"bridge:seq:x"),
+            Some(&b"v"[..])
+        );
+        assert_eq!(forest.get(TreeId::Dids, b"bridge:seq:x"), None);
+        let r = forest.sub_roots();
+        assert_eq!(r[2], forest.subtree_root(TreeId::Credentials));
+        assert_eq!(
+            global_state_root(&r[0], &r[1], &r[2], &r[3]),
+            forest.global_root()
+        );
     }
 }

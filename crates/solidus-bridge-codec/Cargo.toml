@@ -1,0 +1,19 @@
+[package]
+name = "solidus-bridge-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Solidus bridge message layouts, ids and consent digests (no_std, shared by chain, contracts and SDK)"
+
+[dependencies]
+sha3 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+hex = { workspace = true }
+solidus-txns = { workspace = true }
+# Signs the attestation vectors with one fixed test key, so Solidity, Anchor and TypeScript each
+# check a real recovery rather than only a hash. Dev-only: the chain signs with its own key
+# material, never with this crate. Already in the workspace lock as a libp2p transitive.
+k256 = "0.13"

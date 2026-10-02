@@ -50,7 +50,7 @@ struct L1World {
 
 fn build_l1_world() -> L1World {
     let mut baseline = InMemoryState::new();
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
 
     let issuer = generate_signing_key();
     let subject = generate_signing_key();
@@ -103,6 +103,7 @@ fn build_l1_world() -> L1World {
         height: 1,
         timestamp_ms: 1_700_000_001_000,
         network: NETWORK,
+        parent_state_root: [0u8; 32],
     };
     let outcome = execute_block_reference(&baseline, &txs, &ctx, &opts).expect("execute");
     assert!(outcome

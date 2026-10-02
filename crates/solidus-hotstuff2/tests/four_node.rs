@@ -112,6 +112,15 @@ impl Node {
                         let _ = tx.send(Input::Timer(view));
                     });
                 }
+                // These harnesses construct the core with `min_block_interval_ms: 0`, so
+                // pacing is off and this cannot be emitted. Panicking rather than
+                // ignoring it: if someone enables pacing here later, a silently
+                // swallowed proposal would look like a liveness bug in consensus
+                // instead of a harness that never drives the pacing timer.
+                Action::SchedulePropose { .. } => {
+                    unreachable!("pacing is disabled in this harness (min_block_interval_ms: 0)")
+                }
+
                 Action::EnteredView(_) => {}
             }
         }
@@ -171,6 +180,11 @@ fn spawn_network(n: usize, pacemaker: Pacemaker) -> Net {
                 secret,
                 committee: committee.clone(),
                 pacemaker: pacemaker.clone(),
+                // Pacing off in tests: these assert on block PRODUCTION,
+                // and a wall-clock gate would make them time-dependent.
+                min_block_interval_ms: 0,
+                idle_heartbeat_ms: 0,
+                idle_grace_ms: 0,
             },
             RoundRobin::new(n),
             EmptyPayloads { ts_ms: 1 },

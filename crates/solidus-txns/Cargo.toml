@@ -3,11 +3,21 @@ name = "solidus-txns"
 version.workspace = true
 edition.workspace = true
 
+# The wire enum needs `CredentialType`, so the credential module cannot be gated
+# wholesale — only the one function that touches BBS+. That keeps zkryptium out
+# of a client that builds DID transactions and never issues a credential.
+#
+# Decided 2026-08-07 while wiring solidus-client; see R3c in the loop plan.
+[features]
+default = []
+bbs = ["solidus-crypto/bbs"]
+
 [dependencies]
 solidus-crypto.workspace = true
 ed25519-dalek.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+bincode.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 

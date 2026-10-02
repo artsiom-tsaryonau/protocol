@@ -8,8 +8,8 @@ name = "solidus-node"
 path = "src/main.rs"
 
 [dependencies]
-solidus-crypto.workspace = true
-solidus-txns.workspace = true
+solidus-crypto = { workspace = true, features = ["consensus"] }
+solidus-txns = { workspace = true, features = ["bbs"] }
 solidus-state.workspace = true
 solidus-consensus.workspace = true
 solidus-rpc.workspace = true

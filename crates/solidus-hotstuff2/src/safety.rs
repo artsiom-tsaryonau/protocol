@@ -57,6 +57,20 @@ impl SafetyState {
         proposal_view > self.last_voted_view && justify_view >= self.high_qc.view
     }
 
+    /// Rebuild from persisted state after a restart.
+    ///
+    /// ⛔ THE ONLY LEGITIMATE WAY TO START WITH A NON-ZERO `last_voted_view`.
+    /// A validator that resumes into a live chain having forgotten its votes
+    /// can vote twice in one view, which is equivocation and is slashable. The
+    /// caller must have read both values from durable storage written BEFORE
+    /// the votes they describe were sent.
+    pub fn resumed(last_voted_view: View, high_qc: QuorumCert) -> Self {
+        Self {
+            last_voted_view,
+            high_qc,
+        }
+    }
+
     /// Record that we voted in `view` (call exactly when a vote is
     /// emitted).
     pub fn record_vote(&mut self, view: View) {

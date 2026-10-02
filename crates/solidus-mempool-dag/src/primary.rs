@@ -76,6 +76,16 @@ impl CertPool {
         }
     }
 
+    /// Do we already hold or have we retired this digest?
+    ///
+    /// ⚠ EXISTS TO SKIP A BLS VERIFICATION, not for logic. Certificates are
+    /// gossiped, so on a committee of N each one arrives N-1 times; verifying
+    /// every copy costs an aggregate BLS check per duplicate. At high batch
+    /// rates that was enough to slow the whole net measurably.
+    pub fn knows(&self, digest: &BatchDigest) -> bool {
+        self.retired.contains(digest) || self.queued.contains(digest)
+    }
+
     pub fn pending(&self) -> usize {
         self.queue.len()
     }

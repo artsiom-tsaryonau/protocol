@@ -42,7 +42,13 @@ impl VoteAggregator {
     ) -> Result<Option<QuorumCert>, ConsensusError> {
         let pk = committee.key(vote.voter)?;
         let msg = vote_message(chain_id, vote.view, &vote.block_hash);
-        if !vote.sig.verify(pk, &msg) {
+        // ⛔ Verify under the ciphersuite OF THIS VOTE'S VIEW. The core signs with
+        // `committee.dst_for_view(view)`; checking with the legacy Basic verify
+        // rejects every valid vote from the activation view on, and no QC forms.
+        if !vote
+            .sig
+            .verify_with_dst(pk, &msg, committee.dst_for_view(vote.view))
+        {
             return Err(ConsensusError::InvalidSignature(vote.voter));
         }
 
@@ -102,7 +108,11 @@ impl TimeoutAggregator {
     ) -> Result<Option<TimeoutCert>, ConsensusError> {
         let pk = committee.key(tv.voter)?;
         let msg = timeout_message(chain_id, tv.view);
-        if !tv.sig.verify(pk, &msg) {
+        // ⛔ Same rule as `add_vote`: the timeout's own view picks the suite.
+        if !tv
+            .sig
+            .verify_with_dst(pk, &msg, committee.dst_for_view(tv.view))
+        {
             return Err(ConsensusError::InvalidSignature(tv.voter));
         }
 
@@ -132,6 +142,15 @@ impl TimeoutAggregator {
             agg_sig,
             high_qc,
         }))
+    }
+
+    /// How many distinct validators have timed out in `view`.
+    ///
+    /// Used for view SYNCHRONISATION rather than certificate formation: a
+    /// quorum makes a TC, but f+1 already proves at least one honest validator
+    /// is in that view, which is enough to follow it there.
+    pub fn votes_for(&self, view: View) -> usize {
+        self.pending.get(&view).map_or(0, |slot| slot.len())
     }
 
     pub fn gc(&mut self, keep_from: View) {

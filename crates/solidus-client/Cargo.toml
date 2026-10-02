@@ -1,0 +1,27 @@
+[package]
+name = "solidus-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client library for the Solidus Network — did:solidus derivation, resolution and credential verification"
+repository = "https://github.com/solidusnetwork/protocol"
+
+# The protocol surface, extracted from the node workspace so an outsider can
+# depend on it without pulling RocksDB, libp2p and a consensus engine.
+#
+# The boundary is asserted, not assumed — see the `dependency_boundary` test.
+
+[dependencies]
+solidus-crypto.workspace = true   # default features only: hash + keys + ed25519
+solidus-txns.workspace = true     # default features: NO bbs, so no zkryptium
+ed25519-dalek.workspace = true
+sha2.workspace = true
+pbkdf2.workspace = true
+hkdf.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+# Credential verification. Pulls zkryptium through solidus-crypto.
+bbs = ["solidus-crypto/bbs"]

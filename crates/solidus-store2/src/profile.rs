@@ -21,7 +21,12 @@ impl Profile {
         opts.set_level_compaction_dynamic_level_bytes(true);
         match self {
             Profile::Testnet => {
-                opts.set_max_total_wal_size(64 * 1024 * 1024);
+                // ⚠ 64 MB HERE PERMITTED A WAL THIS STORE COULD NOT REPLAY.
+                // 24 MB already needed more than 9,8 GB of RAM plus swap to open,
+                // so the old ceiling allowed 2,7x an already-fatal size. With
+                // `prune_cold_before` now flushing, the WAL should stay far below
+                // this; the ceiling is the backstop, not the mechanism.
+                opts.set_max_total_wal_size(16 * 1024 * 1024);
                 opts.set_keep_log_file_num(1);
                 opts.set_recycle_log_file_num(0);
                 opts.set_max_open_files(128);
@@ -31,7 +36,12 @@ impl Profile {
                 opts.set_max_bytes_for_level_base(64 * 1024 * 1024);
             }
             Profile::Mainnet => {
-                opts.set_max_total_wal_size(1024 * 1024 * 1024);
+                // ⚠ 1 GB HERE WAS ~43x THE 24 MB THAT FAILED TO BOOT ON TESTNET.
+                // Validator-class hardware has more RAM, but the tombstone-replay
+                // blow-up is superlinear, so a bigger box does not buy proportional
+                // headroom. Mainnet inherits this failure the moment it passes its
+                // own `block_retention` horizon.
+                opts.set_max_total_wal_size(128 * 1024 * 1024);
                 opts.set_keep_log_file_num(4);
                 opts.set_max_open_files(4096);
                 opts.set_write_buffer_size(256 * 1024 * 1024);

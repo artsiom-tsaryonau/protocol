@@ -34,25 +34,7 @@ pub struct GenesisValidator {
     pub address: String,
     pub ed25519_public_key: String,
     pub bls_public_key: String,
-    /// INERT — written to genesis.json, never applied to chain state.
-    ///
-    /// Startup applies `initial_balances` only; `CF_VALIDATORS` is written
-    /// exclusively by `save_validator` during transaction execution, so a
-    /// genesis validator has NO validator record until it stakes on-chain.
-    /// `solidus_getValidators` reads `CF_VALIDATORS`, which is why the live
-    /// testnet reports `staked: 0, reputation: 0` for its four genesis
-    /// validators even though this file says 10M SLDS each.
-    ///
-    /// That is not a safety problem: HotStuff here counts VOTES, not stake
-    /// (`quorum_threshold` is a `usize` compared against `votes.len()`), and
-    /// committee identity comes from `load_genesis_validators`, not from any
-    /// stake record. Genesis validators have full, equal consensus power.
-    ///
-    /// Do not "fix" a zero by editing this field — nothing reads it. Applying
-    /// genesis stake to state is a real change to chain state and needs its
-    /// own decision, not a value tweak here.
     pub stake: u64,
-    /// INERT — see `stake` above. Written to genesis.json, never read.
     pub reputation: u64,
 }
 

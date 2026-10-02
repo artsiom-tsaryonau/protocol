@@ -2,8 +2,19 @@ use blst::min_pk::{AggregateSignature, PublicKey, SecretKey, Signature};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-/// Domain separation tag for BLS signatures in the Solidus protocol.
-const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+/// IRTF Basic ciphersuite. Every signature before the PoP activation view uses it.
+///
+/// ⛔ BASIC IS ONLY SAFE FOR DISTINCT MESSAGES. Same-message aggregation
+/// (`fast_aggregate_verify`) needs the PoP ciphersuite plus a verified proof of
+/// possession for every key, which `solidus_hotstuff2::types::Committee` enforces.
+pub const DST_BASIC: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+/// IRTF proof-of-possession ciphersuite, signature tag.
+pub const DST_POP_SIG: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+/// IRTF proof-of-possession ciphersuite, PopProve tag.
+pub const DST_POP_PROOF: &[u8] = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// The DST behind the legacy `sign`/`verify`/`fast_aggregate_verify` methods.
+const DST: &[u8] = DST_BASIC;
 
 /// Errors returned by BLS cryptographic operations.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -44,6 +55,17 @@ impl BlsSecretKey {
         BlsSignature(self.0.sign(msg, DST, &[]))
     }
 
+    /// Sign under an explicit ciphersuite tag.
+    pub fn sign_with_dst(&self, msg: &[u8], dst: &[u8]) -> BlsSignature {
+        BlsSignature(self.0.sign(msg, dst, &[]))
+    }
+
+    /// IRTF PopProve: sign the 48-byte compressed public key under `DST_POP_PROOF`.
+    pub fn prove_possession(&self) -> BlsSignature {
+        let pk = self.public_key().to_bytes();
+        BlsSignature(self.0.sign(&pk, DST_POP_PROOF, &[]))
+    }
+
     /// Serialize the secret key to 32 bytes.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
@@ -66,6 +88,11 @@ impl BlsSecretKey {
 pub struct BlsPublicKey(PublicKey);
 
 impl BlsPublicKey {
+    /// IRTF PopVerify.
+    pub fn verify_possession(&self, pop: &BlsSignature) -> bool {
+        pop.verify_with_dst(self, &self.to_bytes(), DST_POP_PROOF)
+    }
+
     /// Serialize the public key to 48 bytes.
     pub fn to_bytes(&self) -> [u8; 48] {
         self.0.to_bytes()
@@ -126,6 +153,28 @@ impl<'de> Deserialize<'de> for BlsPublicKey {
 pub struct BlsSignature(Signature);
 
 impl BlsSignature {
+    /// Verify under an explicit ciphersuite tag.
+    pub fn verify_with_dst(&self, pk: &BlsPublicKey, msg: &[u8], dst: &[u8]) -> bool {
+        self.0.verify(true, msg, dst, &[], &pk.0, true) == blst::BLST_ERROR::BLST_SUCCESS
+    }
+
+    /// Same-message aggregate verification under an explicit ciphersuite tag.
+    ///
+    /// ⛔ Under `DST_POP_SIG` this is rogue-key safe ONLY if every key's proof of
+    /// possession was verified first. The committee does that at admission.
+    pub fn fast_aggregate_verify_with_dst(
+        &self,
+        pks: &[&BlsPublicKey],
+        msg: &[u8],
+        dst: &[u8],
+    ) -> bool {
+        if pks.is_empty() {
+            return false;
+        }
+        let raw_pks: Vec<&PublicKey> = pks.iter().map(|pk| &pk.0).collect();
+        self.0.fast_aggregate_verify(true, msg, dst, &raw_pks) == blst::BLST_ERROR::BLST_SUCCESS
+    }
+
     /// Verify this signature against a single public key and message.
     /// Returns `true` if valid.
     pub fn verify(&self, pk: &BlsPublicKey, msg: &[u8]) -> bool {

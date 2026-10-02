@@ -121,6 +121,7 @@ impl Harness {
             height: self.height,
             timestamp_ms: ts,
             network: NETWORK,
+            parent_state_root: [0u8; 32],
         };
         let opts = ExecOptions::legacy_anchor(self.treasury, self.validators.clone());
         let outcome = execute_block_reference(&self.baseline, txs, &ctx, &opts)

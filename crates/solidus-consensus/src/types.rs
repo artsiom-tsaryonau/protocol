@@ -196,6 +196,19 @@ pub struct TimeoutVote {
     pub bls_signature: BlsSignature,
 }
 
+impl TimeoutVote {
+    /// The exact bytes a validator signs when it times out on `round`.
+    ///
+    /// This existed only as a `format!` literal inside the node's pacemaker
+    /// loop, so the message was defined by whoever produced it and the unit
+    /// tests signed something else entirely (`round.to_le_bytes()`). Nothing
+    /// noticed, because nothing verified. A signature scheme needs ONE
+    /// definition of what is signed, in the type that carries it.
+    pub fn signing_bytes(round: u64) -> Vec<u8> {
+        format!("timeout_{round}").into_bytes()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TimeoutCertificate
 // ---------------------------------------------------------------------------
@@ -339,6 +352,25 @@ mod tests {
             aggregate_sig,
             signers,
         }
+    }
+
+    // The bytes a validator signs on timeout are a WIRE FORMAT: every node must
+    // produce the identical string or their signatures stop aggregating and the
+    // network cannot change round. It lived as a `format!` literal in the
+    // node's pacemaker loop until 2026-08-24, so pin it here -- a refactor that
+    // "tidies" this string desyncs a mixed-version network silently.
+    #[test]
+    fn timeout_signing_bytes_are_the_deployed_format() {
+        assert_eq!(
+            TimeoutVote::signing_bytes(7),
+            b"timeout_7".to_vec(),
+            "the signed message must stay byte-identical to the deployed literal"
+        );
+        assert_ne!(
+            TimeoutVote::signing_bytes(7),
+            TimeoutVote::signing_bytes(8),
+            "the round must be bound into the signature"
+        );
     }
 
     #[test]

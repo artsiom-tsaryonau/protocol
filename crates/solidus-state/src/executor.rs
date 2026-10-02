@@ -501,6 +501,80 @@ pub fn execute_block(
         // 6. Dispatch to handler
         // -----------------------------------------------------------------
         match &tx.payload {
+            // ⛔ v2-ONLY PAYLOAD. THE LIVE CHAIN REJECTS IT, DELIBERATELY.
+            //
+            // `solidus-txns` is shared between v1 and v2 (Rebuild #2 §5.1), so the type
+            // exists here whether or not this chain understands it. Rebuild #2 BD-6b puts
+            // the commitment-subject credential on the v2 chain-id, where a breaking
+            // payload change costs no migration because v2 has no state. The acceptance
+            // boundary therefore lives in the EXECUTORS, not in the type, and this is the
+            // half that says no.
+            //
+            // Rejected as a FAILED receipt rather than a panic or a silent skip: a node
+            // that panicked here would halt on a tx any peer could submit, and one that
+            // ignored it would let two chains disagree about whether a block is valid,
+            // which is a fork. A deterministic failure is the only safe answer.
+            //
+            // ⚠ If v1 ever needs this payload, do NOT flip this arm on its own. The
+            // subject commitment changes `build_credential_id`, `CredentialRecord` and
+            // `Event::CredentialIssued` together; accepting the payload while the rest of
+            // v1 still speaks `subject_did` would write records nothing can read back.
+            TxPayload::CredentialIssueV2 { .. } => {
+                save_account(store, &sender)?;
+                total_fees += fee;
+                let receipt = compute_failed(
+                    tx_hash,
+                    block_height,
+                    fee,
+                    "CredentialIssueV2 is a v2-chain payload and is not accepted on this chain"
+                        .to_string(),
+                );
+                store_receipt(store, &receipt)?;
+                receipts.push(receipt);
+            }
+            // ⛔ v2-ONLY BRIDGE PAYLOADS (bridge plan 02). Same rule as the arm above: a
+            // deterministic failed receipt, never a panic or a skip. The v1 chain has no
+            // bridge state, and its `is_fee_exempt` does not list these, so the fee is
+            // `TxPayload::fee()`, which is 0 for all three.
+            TxPayload::BridgeGovernance { .. }
+            | TxPayload::ExportCredential { .. }
+            | TxPayload::UnexportCredential { .. } => {
+                save_account(store, &sender)?;
+                total_fees += fee;
+                let receipt = compute_failed(
+                    tx_hash,
+                    block_height,
+                    fee,
+                    "bridge payloads are v2-chain payloads and are not accepted on this chain"
+                        .to_string(),
+                );
+                store_receipt(store, &receipt)?;
+                receipts.push(receipt);
+            }
+            // ⛔ v2-ONLY CREDENTIAL TYPE. `AccreditedIssuer` is a bridge accreditation,
+            // accepted on the v2 chain only from a bridge trust root. This chain has no
+            // trust roots, so it refuses the type on every issue path rather than letting
+            // any issuer mint one.
+            TxPayload::CredentialIssue {
+                credential_type: solidus_txns::credential::CredentialType::AccreditedIssuer,
+                ..
+            }
+            | TxPayload::CredentialIssueBbs {
+                credential_type: solidus_txns::credential::CredentialType::AccreditedIssuer,
+                ..
+            } => {
+                save_account(store, &sender)?;
+                total_fees += fee;
+                let receipt = compute_failed(
+                    tx_hash,
+                    block_height,
+                    fee,
+                    "AccreditedIssuer is a v2-chain credential type and is not accepted on this chain"
+                        .to_string(),
+                );
+                store_receipt(store, &receipt)?;
+                receipts.push(receipt);
+            }
             TxPayload::Transfer { to, amount } => {
                 let to = *to;
                 let amount = *amount;
@@ -1608,6 +1682,87 @@ mod tests {
         let sender = load_account(&store, &sender_addr).expect("load sender failed");
         assert_eq!(sender.balance, 1_000_000);
         assert_eq!(sender.nonce, 0);
+    }
+
+    /// ⛔ THE CHAIN INCLUDES THE SAME TRANSACTION IN CONSECUTIVE BLOCKS, AND THAT USED TO
+    /// DESTROY ITS RECEIPT. Measured on the live testnet 2026-09-24: tx df8676b0… landed in
+    /// blocks 3222202 AND 3222203, proposed by validator 0 then validator 1. Each validator's
+    /// worker seals its own batch (`Worker::seal_batch`), the DAG mempool dedupes BATCHES by
+    /// digest and nothing dedupes TRANSACTIONS across batches — which is normal for a
+    /// Narwhal-style mempool, because such systems deduplicate at EXECUTION.
+    ///
+    /// The first execution succeeded and bumped the sender's nonce. The second then failed the
+    /// nonce check against the account its own first copy had moved, and the failed receipt
+    /// OVERWROTE the successful one. So `solidus_getReceipt` reported `failed: invalid nonce`
+    /// for a transfer whose money had demonstrably arrived, for every transaction on the chain.
+    ///
+    /// ⚠ Receipts live in `CF_RECEIPTS` and `compute_state_root` covers only accounts, DIDs,
+    /// credentials and validators, so this is local bookkeeping and NOT consensus state. Not
+    /// overwriting a decided receipt changes no state root and needs no activation height.
+    #[test]
+    fn a_transaction_included_twice_keeps_its_successful_receipt() {
+        let (store, _dir) = open_tmp();
+        let sender_key = generate_signing_key();
+        let receiver_key = generate_signing_key();
+        let sender_addr = Address::from_public_key(&sender_key.verifying_key());
+        let receiver_addr = Address::from_public_key(&receiver_key.verifying_key());
+        fund_account(&store, sender_addr, 1_000_000);
+        let treasury_addr = Address::from_bytes([0xAAu8; 20]);
+
+        let tx = make_transfer_tx(&sender_key, receiver_addr, 100, 0);
+
+        let first = execute_block(
+            &store,
+            std::slice::from_ref(&tx),
+            1,
+            1_700_000_000_000,
+            &treasury_addr,
+            &[],
+            "testnet",
+        )
+        .expect("first execute_block failed");
+        assert!(
+            matches!(first[0].status, TxStatus::Success),
+            "first copy must succeed"
+        );
+        let tx_hash = first[0].tx_hash;
+
+        // The SAME transaction, re-included by the next proposer.
+        let second = execute_block(
+            &store,
+            &[tx],
+            2,
+            1_700_000_001_000,
+            &treasury_addr,
+            &[],
+            "testnet",
+        )
+        .expect("second execute_block failed");
+        // ⚠ THE v1 EXECUTOR SHORT-CIRCUITS ON A KNOWN tx_hash (guard added 97ce44297,
+        // 2026-05-19), so the duplicate returns the CACHED receipt rather than re-executing
+        // and failing the nonce check. That is the behaviour this test pins.
+        assert!(
+            matches!(second[0].status, TxStatus::Success),
+            "the duplicate must return the cached success, not a bogus nonce failure: {:?}",
+            second[0].status
+        );
+
+        // …and the STORED receipt must still describe what actually happened.
+        let stored = load_receipt(&store, &tx_hash)
+            .expect("load_receipt failed")
+            .expect("a receipt must exist");
+        assert!(
+            matches!(stored.status, TxStatus::Success),
+            "the duplicate overwrote a successful receipt: {:?}",
+            stored.status
+        );
+
+        // And the money moved exactly once.
+        let receiver = load_account(&store, &receiver_addr).expect("load receiver failed");
+        assert_eq!(
+            receiver.balance, 100,
+            "the transfer must apply exactly once"
+        );
     }
 
     #[test]

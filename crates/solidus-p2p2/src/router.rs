@@ -35,11 +35,21 @@ pub fn route_output(output: &NodeOutput) -> Outbound {
                 from: u32::MAX,
             },
         },
+        NodeOutput::BroadcastCert(cert) => Outbound::Publish {
+            topic: Topic::Certs,
+            message: NetMessage::Cert(cert.clone()),
+        },
         NodeOutput::SendAck { to, ack } => Outbound::SendTo {
             peer: *to,
             message: NetMessage::Ack(ack.clone()),
         },
         NodeOutput::BlockExecuted { .. } => Outbound::Local,
+        // The runner handles these directly: they need the peer directory to
+        // choose a target, which the router has no access to and should not.
+        NodeOutput::NeedBlocks { .. }
+        | NodeOutput::NeedBlockBody { .. }
+        | NodeOutput::SendBlockBody { .. }
+        | NodeOutput::SendBlockRange { .. } => Outbound::Local,
     }
 }
 
@@ -67,15 +77,24 @@ fn route_action(action: &Action) -> Outbound {
         },
         // Local effects the swarm handles without the network: commit
         // bookkeeping, arming the view timer, telemetry.
-        Action::Commit(_) | Action::ScheduleTimeout { .. } | Action::EnteredView(_) => {
-            Outbound::Local
-        }
+        Action::Commit(_)
+        | Action::ScheduleTimeout { .. }
+        | Action::SchedulePropose { .. }
+        | Action::EnteredView(_) => Outbound::Local,
     }
 }
 
 /// Map a received frame to the node input it should be fed as.
-pub fn route_inbound(message: NetMessage) -> NodeInput {
-    match message {
+/// Map a received frame to a consensus input.
+///
+/// Returns `None` for frames the CONSENSUS core has no opinion about — today
+/// the block-range pair and the block-body pair, both of which the runner
+/// answers from the store rather than from consensus state. Making this
+/// an `Option` rather than inventing a no-op `NodeInput` keeps "not a consensus
+/// event" explicit at the type level, so the next transport-only message class
+/// cannot be quietly fed into the state machine.
+pub fn route_inbound(message: NetMessage) -> Option<NodeInput> {
+    Some(match message {
         NetMessage::Proposal(p) => NodeInput::Proposal(p),
         NetMessage::Qc(qc) => NodeInput::Qc(qc),
         NetMessage::Tc(tc) => NodeInput::Tc(tc),
@@ -83,7 +102,12 @@ pub fn route_inbound(message: NetMessage) -> NodeInput {
         NetMessage::Vote(v) => NodeInput::Vote(v),
         NetMessage::Batch { batch, from } => NodeInput::Batch { batch, from },
         NetMessage::Ack(ack) => NodeInput::Ack(ack),
-    }
+        NetMessage::Cert(cert) => NodeInput::Cert(cert),
+        NetMessage::GetBlockRange { .. }
+        | NetMessage::BlockRange { .. }
+        | NetMessage::GetBlockBody { .. }
+        | NetMessage::BlockBody { .. } => return None,
+    })
 }
 
 #[cfg(test)]
@@ -116,6 +140,11 @@ mod tests {
                 secret: solidus_crypto::bls::BlsSecretKey::from_bytes(&sks[1].to_bytes()).unwrap(),
                 committee,
                 pacemaker: Pacemaker::default(),
+                // Pacing off in tests: these assert on block PRODUCTION,
+                // and a wall-clock gate would make them time-dependent.
+                min_block_interval_ms: 0,
+                idle_heartbeat_ms: 0,
+                idle_grace_ms: 0,
             },
             RoundRobin::new(4),
             EmptyPayloads { ts_ms: 1 },
@@ -191,7 +220,7 @@ mod tests {
         let qc = solidus_hotstuff2::QuorumCert::genesis([3; 32], sk.sign(b"g"));
         assert!(matches!(
             route_inbound(NetMessage::Qc(qc)),
-            NodeInput::Qc(_)
+            Some(NodeInput::Qc(_))
         ));
         assert!(matches!(
             route_inbound(NetMessage::Batch {
@@ -200,7 +229,45 @@ mod tests {
                 },
                 from: 5
             }),
-            NodeInput::Batch { from: 5, .. }
+            Some(NodeInput::Batch { from: 5, .. })
         ));
+    }
+
+    /// Body-fetch frames are TRANSPORT too. A peer must not be able to drive
+    /// the consensus state machine by asking for, or supplying, a block body:
+    /// the node accepts a body only when it matches a QC it already verified,
+    /// and that check lives in `solidus-node2`, not here.
+    #[test]
+    fn block_body_frames_are_not_consensus_inputs() {
+        assert!(
+            route_inbound(NetMessage::GetBlockBody { hash: [1u8; 32] }).is_none(),
+            "a body REQUEST must never reach the consensus core"
+        );
+        assert!(
+            route_inbound(NetMessage::BlockBody {
+                bytes: vec![1, 2, 3]
+            })
+            .is_none(),
+            "a body RESPONSE must never reach the consensus core"
+        );
+    }
+
+    /// Block-range frames are TRANSPORT, not consensus. If either ever routes
+    /// to a `NodeInput`, a peer could drive the state machine by asking for
+    /// history, so this asserts the boundary rather than trusting it.
+    #[test]
+    fn block_range_frames_are_not_consensus_inputs() {
+        assert!(
+            route_inbound(NetMessage::GetBlockRange { from: 1, to: 10 }).is_none(),
+            "a range REQUEST must never reach the consensus core"
+        );
+        assert!(
+            route_inbound(NetMessage::BlockRange {
+                blocks: vec![vec![1, 2, 3]],
+                batches: vec![vec![4, 5, 6]],
+            })
+            .is_none(),
+            "a range RESPONSE must never reach the consensus core"
+        );
     }
 }

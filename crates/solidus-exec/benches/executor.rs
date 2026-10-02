@@ -75,8 +75,9 @@ fn bench_reference_transfer_block(c: &mut Criterion) {
             height: 1,
             timestamp_ms: 1_700_000_000_000,
             network: "v2-bench",
+            parent_state_root: [0u8; 32],
         };
-        let opts = ExecOptions::v2_defaults();
+        let opts = ExecOptions::v2_defaults(50_002);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_function(format!("{n}"), |b| {
             b.iter(|| execute_block_reference(&state, &txs, &ctx, &opts).expect("execute"))
@@ -162,8 +163,9 @@ fn bench_incremental_root_apply(c: &mut Criterion) {
         height: 1,
         timestamp_ms: 1_700_000_000_000,
         network: "v2-bench",
+        parent_state_root: [0u8; 32],
     };
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
     let outcome = execute_block_reference(&state, &txs, &ctx, &opts).expect("execute");
 
     let mut group = c.benchmark_group("incremental_root_apply");
@@ -201,8 +203,9 @@ fn register_identities(state: &mut InMemoryState, n_subjects: usize) -> (Signing
         height: 1,
         timestamp_ms: 1_700_000_000_000,
         network: "v2-bench",
+        parent_state_root: [0u8; 32],
     };
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
 
     let issuer = generate_signing_key();
     let mut txs = Vec::with_capacity(n_subjects + 1);
@@ -267,8 +270,9 @@ fn bench_twolane_payment_lane(c: &mut Criterion) {
         height: 1,
         timestamp_ms: 1_700_000_000_000,
         network: "v2-bench",
+        parent_state_root: [0u8; 32],
     };
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
 
     let mut group = c.benchmark_group("twolane_payment_lane");
     group.sample_size(10);
@@ -293,8 +297,9 @@ fn bench_twolane_identity_lane(c: &mut Criterion) {
         height: 2,
         timestamp_ms: 1_700_000_002_000,
         network: "v2-bench",
+        parent_state_root: [0u8; 32],
     };
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
 
     let mut group = c.benchmark_group("twolane_identity_lane");
     group.sample_size(10);
@@ -319,8 +324,9 @@ fn bench_twolane_mixed_95_5(c: &mut Criterion) {
         height: 2,
         timestamp_ms: 1_700_000_002_000,
         network: "v2-bench",
+        parent_state_root: [0u8; 32],
     };
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
 
     let mut group = c.benchmark_group("twolane_mixed_95_5");
     group.sample_size(10);

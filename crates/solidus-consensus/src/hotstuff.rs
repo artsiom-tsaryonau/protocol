@@ -370,6 +370,42 @@ impl HotStuffEngine {
             return None;
         }
 
+        // Reject votes from outside the committee. The bitvector loop below
+        // already skipped an out-of-range index, which silently dropped the
+        // signer while its signature still entered the aggregate: a QC that
+        // cannot verify. Rejecting at intake is the only place that helps.
+        let Some(voter) = self.validators.get(vote.voter_index) else {
+            warn!(
+                voter_index = vote.voter_index,
+                committee_size = self.validators.len(),
+                "ignoring vote from outside the committee"
+            );
+            return None;
+        };
+
+        // Verify the vote's signature against that validator's key.
+        //
+        // ⚠ This is INDIVIDUAL verification, deliberately, and not the
+        // aggregate path. `QuorumCertificate::verify` uses
+        // `fast_aggregate_verify`, which is a proof-of-possession scheme
+        // operation being run under a basic-scheme (`_NUL_`) DST with no PoP
+        // registered anywhere: unsafe for same-message aggregation, filed
+        // separately as the BLS scheme mismatch. `BlsSignature::verify` on a
+        // single key carries none of that, and checking each vote here blunts
+        // the rogue-key attack as a side effect, because a rogue key's
+        // INDIVIDUAL signature does not verify.
+        if !vote
+            .bls_signature
+            .verify(&voter.bls_pubkey, &vote.block_hash)
+        {
+            warn!(
+                voter_index = vote.voter_index,
+                round = vote.round,
+                "ignoring vote whose BLS signature does not verify"
+            );
+            return None;
+        }
+
         let block_hash = vote.block_hash;
 
         let votes = self.pending_votes.entry(block_hash).or_default();
@@ -463,6 +499,36 @@ impl HotStuffEngine {
     /// (every subsequent vote from a known voter would otherwise short-circuit
     /// out at the dedup check).
     pub fn process_timeout_vote(&mut self, tv: TimeoutVote) -> Option<TimeoutCertificate> {
+        // Reject a voter index outside the committee BEFORE anything else.
+        // `try_form_tc`'s bitvector loop skips such an index while its
+        // signature still enters the aggregate, so the TC's signer set would
+        // not match what was aggregated -- the same mismatch the vote path
+        // had. Rejecting at intake is the only place that helps.
+        let Some(voter) = self.validators.get(tv.voter_index) else {
+            warn!(
+                voter_index = tv.voter_index,
+                committee = self.validators.len(),
+                "rejected timeout vote: voter index outside the committee"
+            );
+            return None;
+        };
+
+        // Verify the signature against that committee member's key. Until
+        // 2026-08-24 a timeout vote was accumulated on trust, so quorum-many
+        // forged votes from any peer forced a TC, which advances the round and
+        // rotates the leader. That is a liveness attack, repeatable at will.
+        if !tv
+            .bls_signature
+            .verify(&voter.bls_pubkey, &TimeoutVote::signing_bytes(tv.round))
+        {
+            warn!(
+                voter_index = tv.voter_index,
+                round = tv.round,
+                "rejected timeout vote: BLS signature does not verify"
+            );
+            return None;
+        }
+
         let tvs = self.pending_timeout_votes.entry(tv.round).or_default();
         let round = tv.round;
 
@@ -602,42 +668,79 @@ impl HotStuffEngine {
             return None;
         }
 
-        // 2. VRF proof verification.
-        if let Some(ref vrf_proof) = block.vrf_proof {
-            // Find the proposer in the validator set.
-            let proposer_index = self
-                .validators
-                .iter()
-                .position(|v| v.address == block.header.proposer);
+        // 2. Proposer legitimacy.
+        //
+        // ⚠ THIS USED TO LIVE ENTIRELY INSIDE `if let Some(vrf_proof)` WITH NO `else`, and the
+        // deployment runs `skip_vrf: true`, so its blocks carry no proof and the whole section was
+        // SKIPPED -- including the check that the proposer is a validator at all. Any peer could
+        // propose a block and every honest node would vote on it.
+        //
+        // The set membership check is unconditional now. What "legitimate" means then depends on
+        // the mode, and both branches end in a decision rather than a fall-through.
+        if self.validators.is_empty() {
+            warn!("rejecting proposal: empty validator set");
+            return None;
+        }
+        let Some(proposer_index) = self
+            .validators
+            .iter()
+            .position(|v| v.address == block.header.proposer)
+        else {
+            warn!(
+                proposer = ?block.header.proposer,
+                "rejecting proposal: proposer not in validator set"
+            );
+            return None;
+        };
 
-            match proposer_index {
-                Some(idx) => {
-                    // Recompute VRF output from proof bytes via BLAKE3.
-                    let vrf_output = VrfOutput(blake3_hash(&vrf_proof.0));
-
-                    if !verify_leader(
-                        &self.validators[idx],
-                        &self.round_seed,
-                        block.header.round,
-                        &vrf_output,
-                        vrf_proof,
-                    ) {
-                        warn!(
-                            proposer_index = idx,
-                            round = block.header.round,
-                            "rejecting proposal: invalid VRF proof"
-                        );
-                        return None;
-                    }
-                }
-                None => {
-                    warn!(
-                        proposer = ?block.header.proposer,
-                        "rejecting proposal: proposer not in validator set"
-                    );
-                    return None;
-                }
+        if self.config.skip_vrf {
+            // Round-robin mode. The leader is `round % n`, which is EXACTLY the rule
+            // `try_propose_if_leader` uses to decide whether to propose; if these two ever
+            // disagree the chain stops producing blocks, so they must be read together.
+            let leader_index = (block.header.round as usize) % self.validators.len();
+            if proposer_index != leader_index {
+                warn!(
+                    proposer_index,
+                    leader_index,
+                    round = block.header.round,
+                    "rejecting proposal: proposer is not this round's leader"
+                );
+                return None;
             }
+        } else {
+            // VRF mode. An ABSENT proof is now a rejection rather than a skip.
+            let Some(ref vrf_proof) = block.vrf_proof else {
+                warn!(
+                    round = block.header.round,
+                    "rejecting proposal: VRF is required and the block carries no proof"
+                );
+                return None;
+            };
+
+            // Recompute VRF output from proof bytes via BLAKE3.
+            let vrf_output = VrfOutput(blake3_hash(&vrf_proof.0));
+
+            if !verify_leader(
+                &self.validators[proposer_index],
+                &self.round_seed,
+                block.header.round,
+                &vrf_output,
+                vrf_proof,
+            ) {
+                warn!(
+                    proposer_index,
+                    round = block.header.round,
+                    "rejecting proposal: invalid VRF proof"
+                );
+                return None;
+            }
+
+            // ⚠ WHAT THIS STILL DOES NOT ESTABLISH, stated so nobody reads it as more than it is:
+            // a valid proof proves "you are a validator and you computed a correct VRF output for
+            // this round". It does NOT prove you WON. Deciding the winner means comparing outputs
+            // via `select_leader_from_outputs`, which needs EVERY validator's output, and a
+            // Byzantine-tolerant protocol cannot wait on all n. That quorum rule is a protocol
+            // design decision and is filed, not guessed at here.
         }
 
         // 3. Safety check: locked_qc constraint.
@@ -692,7 +795,36 @@ impl HotStuffEngine {
     /// - Updates `highest_qc` if the new QC has a higher round.
     /// - Updates `locked_qc`: the previous `highest_qc` becomes the new
     ///   `locked_qc` (one-behind locking rule).
-    pub fn on_new_qc(&mut self, qc: &QuorumCertificate) {
+    pub fn on_new_qc(&mut self, qc: &QuorumCertificate) -> bool {
+        // A QC reaches here from three directions -- a proposal's `justify_qc`,
+        // a relayed `NewQC`, and the one this node forms from votes it has
+        // already verified. Only the third is trustworthy by construction, and
+        // until 2026-08-24 none of them was checked: `QuorumCertificate::verify`
+        // was written, complete, and called by nothing outside its own unit
+        // tests. Adopting an unverified QC moves `locked_qc` and feeds
+        // `try_commit`, so the cost of skipping this is a finalised block that
+        // no validator voted for.
+        //
+        // Return `false` rather than panicking: a bad QC is an untrusted peer's
+        // message, not a local invariant violation.
+        //
+        // ⚠ This closes forgery by a party holding NO committee key. It does
+        // NOT close the rogue-key attack, because `verify` reaches
+        // `fast_aggregate_verify` under a basic-scheme `_NUL_` DST with no
+        // proof of possession anywhere in the workspace. That is the separately
+        // filed BLS SCHEME MISMATCH [critical] [pre-mainnet], held by the fact
+        // that validator BLS keys are operator config on a permissioned
+        // committee and cannot be registered permissionlessly.
+        // `check-bls-rogue-key-tripwire.mjs` fails the day that changes.
+        if !qc.verify(&self.validators, self.config.quorum_threshold) {
+            warn!(
+                round = qc.round,
+                signer_count = qc.signer_count(),
+                "rejected QC: aggregate signature does not verify for the signer set"
+            );
+            return false;
+        }
+
         let new_round = qc.round;
 
         // Compare against the Option, not an unwrap_or(0) sentinel: with the
@@ -718,6 +850,8 @@ impl HotStuffEngine {
                 "updated QC state"
             );
         }
+
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -1037,6 +1171,292 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test 1a: a vote whose BLS signature does not verify is rejected
+    //
+    // The network handler passes a VoteMsg straight into process_vote after a
+    // stale-round check, so anything accepted here was accepted from the wire.
+    // Until this landed, nothing on that path checked the signature at all:
+    // QuorumCertificate::verify existed but its only callers were tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn process_vote_rejects_a_signature_that_does_not_verify() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        let honest = engines[1]
+            .validate_and_vote(&block)
+            .expect("engine 1 should vote");
+
+        // Same block, same round, same voter index -- but signed by a key that
+        // is not validator 1's. This is what an attacker can produce.
+        let forged = Vote {
+            bls_signature: BlsSecretKey::generate().sign(&block.hash()),
+            ..honest.clone()
+        };
+
+        assert!(
+            engines[0].process_vote(forged).is_none(),
+            "a forged vote must not form a QC"
+        );
+        assert!(
+            engines[0]
+                .pending_votes
+                .get(&block.hash())
+                .is_none_or(|v| v.is_empty()),
+            "a forged vote must not be accumulated at all"
+        );
+    }
+
+    #[test]
+    fn forged_votes_cannot_reach_quorum() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        // Three forged votes, one per committee slot, each signed by a key the
+        // committee does not hold. Under the unverified path these reached the
+        // quorum threshold and produced a QC.
+        for voter_index in 1..4 {
+            let vote = Vote {
+                block_hash: block.hash(),
+                round: engines[0].pacemaker.current_round(),
+                voter_index,
+                bls_signature: BlsSecretKey::generate().sign(&block.hash()),
+            };
+            assert!(
+                engines[0].process_vote(vote).is_none(),
+                "forged vote {voter_index} must not form a QC"
+            );
+        }
+    }
+
+    #[test]
+    fn process_vote_rejects_a_voter_index_outside_the_committee() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        let honest = engines[1]
+            .validate_and_vote(&block)
+            .expect("engine 1 should vote");
+
+        // Out of range for a 4-member committee. The bitvector loop already
+        // skipped such an index, which silently dropped the signer while its
+        // signature still entered the aggregate -- a QC that cannot verify.
+        let out_of_range = Vote {
+            voter_index: 9,
+            ..honest.clone()
+        };
+
+        assert!(
+            engines[0].process_vote(out_of_range).is_none(),
+            "a vote from outside the committee must not form a QC"
+        );
+        assert!(
+            engines[0]
+                .pending_votes
+                .get(&block.hash())
+                .is_none_or(|v| v.is_empty()),
+            "a vote from outside the committee must not be accumulated"
+        );
+    }
+
+    // CONTROL: an honest vote must still be accepted, or the check above is
+    // just a mute button. This asserts accumulation, which the quorum test
+    // covers only indirectly.
+    #[test]
+    fn process_vote_still_accepts_an_honest_vote() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        let honest = engines[1]
+            .validate_and_vote(&block)
+            .expect("engine 1 should vote");
+
+        assert!(
+            engines[0].process_vote(honest).is_none(),
+            "one vote is not a quorum"
+        );
+        assert_eq!(
+            engines[0]
+                .pending_votes
+                .get(&block.hash())
+                .map(|v| v.len())
+                .unwrap_or(0),
+            1,
+            "the honest vote must be accumulated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A QUORUM CERTIFICATE ARRIVING FROM THE NETWORK IS ALSO A SIGNATURE
+    //
+    // Closing the vote path alone left the certificate path open: a QC reaches
+    // `on_new_qc` from THREE directions -- a proposal's `justify_qc`, a
+    // relayed `NewQC`, and the QC this node forms itself -- and only the third
+    // is verified by construction. `QuorumCertificate::verify` was already
+    // written and complete; nothing outside its own unit tests ever called it.
+    //
+    // These assert on STATE, not on a return value: adopting a forged QC as
+    // `highest_qc` is what moves the lock and lets `try_commit` finalise a
+    // block, so state is the property that matters.
+    // -----------------------------------------------------------------------
+
+    /// Build a QC whose aggregate signature is genuine but covers `signed_over`
+    /// rather than the block hash the QC claims to certify.
+    fn qc_over(
+        engines: &[HotStuffEngine],
+        claimed_hash: [u8; 32],
+        signed_over: &[u8],
+        signer_indices: &[usize],
+        bitvec_len: usize,
+    ) -> QuorumCertificate {
+        let sigs: Vec<_> = signer_indices
+            .iter()
+            .map(|&i| engines[i].bls_sk.sign(signed_over))
+            .collect();
+        let refs: Vec<&BlsSignature> = sigs.iter().collect();
+        let mut signers = bitvec![u8, Msb0; 0; bitvec_len];
+        for &i in signer_indices {
+            signers.set(i, true);
+        }
+        QuorumCertificate {
+            block_hash: claimed_hash,
+            round: 0,
+            aggregate_sig: BlsSignature::aggregate(&refs).expect("aggregate"),
+            signers,
+        }
+    }
+
+    #[test]
+    fn forged_qc_is_not_adopted_as_highest() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        // Quorum-many committee members, a real aggregate signature -- over the
+        // wrong message. This is the shape an attacker can produce without
+        // holding any committee key at all, using signatures replayed from
+        // anywhere else.
+        let forged = qc_over(
+            &engines,
+            block.hash(),
+            b"a different message",
+            &[0, 1, 2],
+            4,
+        );
+
+        engines[0].on_new_qc(&forged);
+        assert!(
+            engines[0].highest_qc.is_none(),
+            "a QC whose aggregate does not cover the block hash must not be adopted"
+        );
+        assert!(
+            engines[0].locked_qc.is_none(),
+            "and it must not move the lock"
+        );
+    }
+
+    #[test]
+    fn qc_with_a_signer_outside_the_committee_is_not_adopted() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        // Bit 4 of a 4-member committee: `validators.get(4)` is None, so the
+        // signer set cannot even be resolved to keys.
+        let sigs: Vec<_> = (0..3)
+            .map(|i| engines[i].bls_sk.sign(&block.hash()))
+            .collect();
+        let refs: Vec<&BlsSignature> = sigs.iter().collect();
+        let mut signers = bitvec![u8, Msb0; 0; 5];
+        for i in [0usize, 1, 4] {
+            signers.set(i, true);
+        }
+        let out_of_committee = QuorumCertificate {
+            block_hash: block.hash(),
+            round: 0,
+            aggregate_sig: BlsSignature::aggregate(&refs).expect("aggregate"),
+            signers,
+        };
+
+        engines[0].on_new_qc(&out_of_committee);
+        assert!(
+            engines[0].highest_qc.is_none(),
+            "a QC naming a signer outside the committee must not be adopted"
+        );
+    }
+
+    #[test]
+    fn qc_below_quorum_is_not_adopted() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        // Two genuine signatures over the right message. Everything about this
+        // QC is honest except that 2 < quorum 3.
+        let short = qc_over(&engines, block.hash(), &block.hash(), &[0, 1], 4);
+
+        engines[0].on_new_qc(&short);
+        assert!(
+            engines[0].highest_qc.is_none(),
+            "a QC below the quorum threshold must not be adopted"
+        );
+    }
+
+    // CONTROL: the guard must not be a mute button. An honest QC -- quorum-many
+    // real signatures over the real block hash -- must still be adopted, or
+    // every node stops advancing and the chain wedges.
+    #[test]
+    fn honest_qc_is_still_adopted() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        let honest = qc_over(&engines, block.hash(), &block.hash(), &[0, 1, 2], 4);
+
+        engines[0].on_new_qc(&honest);
+        assert_eq!(
+            engines[0].highest_qc.as_ref().map(|q| q.block_hash),
+            Some(block.hash()),
+            "an honest QC must still become highest_qc"
+        );
+    }
+
+    // CONTROL: the node's OWN QC must verify under its own rule, and a QC
+    // carrying MORE than quorum signers must verify too.
+    //
+    // ⚠ MEASURED, and it corrected this test's first premise: a locally formed
+    // QC always carries EXACTLY quorum signers. `try_form_qc` removes the
+    // pending-vote bucket at formation, so a fourth vote arriving afterwards
+    // starts a fresh bucket and forms nothing. The >quorum case therefore has
+    // to be constructed to be tested at all -- it is reachable from a peer, not
+    // from this node's own aggregation.
+    #[test]
+    fn locally_formed_and_larger_than_quorum_qcs_both_verify() {
+        let mut engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+
+        let own = engines[0].validate_and_vote(&block).expect("self-vote");
+        let v1 = engines[1].validate_and_vote(&block).expect("peer 1");
+        let v2 = engines[2].validate_and_vote(&block).expect("peer 2");
+        engines[0].record_own_vote(own);
+        engines[0].process_vote(v1);
+        let qc = engines[0].process_vote(v2).expect("QC at quorum");
+        assert_eq!(
+            qc.signer_count(),
+            3,
+            "a locally formed QC carries exactly quorum signers"
+        );
+        assert!(
+            engines[0].on_new_qc(&qc),
+            "the QC this node just formed must verify under its own rule"
+        );
+
+        // All four committee members, genuine signatures over the block hash.
+        let four = qc_over(&engines, block.hash(), &block.hash(), &[0, 1, 2, 3], 4);
+        assert!(
+            engines[1].on_new_qc(&four),
+            "a QC with more signers than quorum must verify, not wedge the node"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test 1b: proposer self-vote gives one fault of margin
     // -----------------------------------------------------------------------
 
@@ -1173,19 +1593,19 @@ mod tests {
             round,
             voter_index: 0,
             highest_qc: None,
-            bls_signature: engines[0].bls_sk.sign(&round.to_le_bytes()),
+            bls_signature: engines[0].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
         };
         let tv1 = TimeoutVote {
             round,
             voter_index: 1,
             highest_qc: None,
-            bls_signature: engines[1].bls_sk.sign(&round.to_le_bytes()),
+            bls_signature: engines[1].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
         };
         let tv2 = TimeoutVote {
             round,
             voter_index: 2,
             highest_qc: None,
-            bls_signature: engines[2].bls_sk.sign(&round.to_le_bytes()),
+            bls_signature: engines[2].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
         };
 
         // Process timeout votes on engine 0.
@@ -1202,6 +1622,124 @@ mod tests {
         assert_eq!(tc.round, round);
         assert_eq!(tc.signers.count_ones(), 3);
         assert!(tc.highest_qc.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // A TIMEOUT VOTE IS A SIGNATURE TOO
+    //
+    // The vote path and the QC path were closed on 2026-08-23 and 08-24. The
+    // timeout path was the same shape and was still open: dedup on
+    // `voter_index`, push, aggregate. Any peer could send quorum-many forged
+    // timeout votes and force a TIMEOUT CERTIFICATE, which advances the round
+    // and rotates the leader -- a liveness attack, repeatable at will.
+    //
+    // Not a safety break: a TC is never transmitted (there is no `NewTC`
+    // message) and its `highest_qc` is not adopted, so a forged timeout vote
+    // cannot smuggle in a commit.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn forged_timeout_vote_is_not_accumulated() {
+        let mut engines = setup_engines(4);
+        let round = engines[0].pacemaker.current_round();
+
+        // Correct message, correct round, committee slot 1 -- signed by a key
+        // the committee does not hold.
+        let forged = TimeoutVote {
+            round,
+            voter_index: 1,
+            highest_qc: None,
+            bls_signature: BlsSecretKey::generate().sign(&TimeoutVote::signing_bytes(round)),
+        };
+
+        assert!(
+            engines[0].process_timeout_vote(forged).is_none(),
+            "a forged timeout vote must not form a TC"
+        );
+        assert!(
+            engines[0]
+                .pending_timeout_votes
+                .get(&round)
+                .is_none_or(|v| v.is_empty()),
+            "a forged timeout vote must not be accumulated at all"
+        );
+    }
+
+    #[test]
+    fn forged_timeout_votes_cannot_force_a_round_change() {
+        let mut engines = setup_engines(4);
+        let round = engines[0].pacemaker.current_round();
+
+        for voter_index in 0..4 {
+            let forged = TimeoutVote {
+                round,
+                voter_index,
+                highest_qc: None,
+                bls_signature: BlsSecretKey::generate().sign(&TimeoutVote::signing_bytes(round)),
+            };
+            assert!(
+                engines[0].process_timeout_vote(forged).is_none(),
+                "forged timeout vote {voter_index} must not form a TC"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_vote_from_outside_the_committee_is_rejected() {
+        let mut engines = setup_engines(4);
+        let round = engines[0].pacemaker.current_round();
+
+        // Index 9 in a 4-member committee. The bitvector loop already skipped
+        // such an index while its signature still entered the aggregate --
+        // the same signer-set mismatch the vote path had.
+        let out_of_range = TimeoutVote {
+            round,
+            voter_index: 9,
+            highest_qc: None,
+            bls_signature: engines[1].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
+        };
+
+        assert!(
+            engines[0].process_timeout_vote(out_of_range).is_none(),
+            "a timeout vote from outside the committee must not form a TC"
+        );
+        assert!(
+            engines[0]
+                .pending_timeout_votes
+                .get(&round)
+                .is_none_or(|v| v.is_empty()),
+            "a timeout vote from outside the committee must not be accumulated"
+        );
+    }
+
+    // CONTROL: an honest timeout vote must still be accumulated. Without this
+    // the three tests above pass just as well against a node that ignores
+    // every timeout vote and can never change round.
+    #[test]
+    fn honest_timeout_vote_is_still_accumulated() {
+        let mut engines = setup_engines(4);
+        let round = engines[0].pacemaker.current_round();
+
+        let honest = TimeoutVote {
+            round,
+            voter_index: 1,
+            highest_qc: None,
+            bls_signature: engines[1].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
+        };
+
+        assert!(
+            engines[0].process_timeout_vote(honest).is_none(),
+            "one timeout vote is not a quorum"
+        );
+        assert_eq!(
+            engines[0]
+                .pending_timeout_votes
+                .get(&round)
+                .map(|v| v.len())
+                .unwrap_or(0),
+            1,
+            "the honest timeout vote must be accumulated"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1233,7 +1771,9 @@ mod tests {
             round,
             voter_index: local,
             highest_qc: None,
-            bls_signature: engines[local].bls_sk.sign(&round.to_le_bytes()),
+            bls_signature: engines[local]
+                .bls_sk
+                .sign(&TimeoutVote::signing_bytes(round)),
         };
 
         // Two peer votes (out of three peers) — simulating the third peer
@@ -1242,13 +1782,13 @@ mod tests {
             round,
             voter_index: 0,
             highest_qc: None,
-            bls_signature: engines[0].bls_sk.sign(&round.to_le_bytes()),
+            bls_signature: engines[0].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
         };
         let peer_tv_b = TimeoutVote {
             round,
             voter_index: 2,
             highest_qc: None,
-            bls_signature: engines[2].bls_sk.sign(&round.to_le_bytes()),
+            bls_signature: engines[2].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
         };
 
         // Step 1 — local records its own vote first (mirrors the consensus
@@ -1325,7 +1865,7 @@ mod tests {
                 round,
                 voter_index: i,
                 highest_qc: None,
-                bls_signature: engines[i].bls_sk.sign(&round.to_le_bytes()),
+                bls_signature: engines[i].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
             })
             .collect();
         engines[3]
@@ -1338,7 +1878,7 @@ mod tests {
             round,
             voter_index: 0,
             highest_qc: None,
-            bls_signature: engines[0].bls_sk.sign(&round.to_le_bytes()),
+            bls_signature: engines[0].bls_sk.sign(&TimeoutVote::signing_bytes(round)),
         };
         let tc = engines[3]
             .process_timeout_vote(dup)
@@ -1371,7 +1911,7 @@ mod tests {
                         round: r,
                         voter_index: 0,
                         highest_qc: None,
-                        bls_signature: engines[0].bls_sk.sign(&r.to_le_bytes()),
+                        bls_signature: engines[0].bls_sk.sign(&TimeoutVote::signing_bytes(r)),
                     },
                 )
             })
@@ -1694,6 +2234,96 @@ mod tests {
             "first post-restart block must extend the surviving tip"
         );
         assert_eq!(block.header.height, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // LEADER LEGITIMACY: "you are a validator" is not "you won this round"
+    //
+    // The VRF section of `validate_and_vote` sat inside `if let Some(vrf_proof)`
+    // with no `else`. The deployed node runs `skip_vrf: true`, so its blocks
+    // carry no proof and that whole section was SKIPPED -- including the check
+    // that the proposer is in the validator set at all. Any peer could propose.
+    // -----------------------------------------------------------------------
+
+    /// Put a committee into the round-robin mode the deployment actually runs.
+    fn round_robin(engines: &mut [HotStuffEngine]) {
+        for e in engines.iter_mut() {
+            e.config.skip_vrf = true;
+        }
+    }
+
+    #[test]
+    fn a_proposal_from_a_non_leader_is_rejected() {
+        let mut engines = setup_engines(4);
+        round_robin(&mut engines);
+
+        // Round 0, so the leader is validator 0 (round % n), the same rule
+        // `try_propose_if_leader` uses to decide who may propose.
+        assert_eq!(engines[0].pacemaker.current_round(), 0);
+        let (block, _) = engines[1].build_block();
+        assert_eq!(block.header.proposer, engines[1].validators[1].address);
+
+        assert!(
+            engines[0].validate_and_vote(&block).is_none(),
+            "a block proposed by validator 1 in round 0 must not be voted on"
+        );
+    }
+
+    #[test]
+    fn a_proposal_from_outside_the_committee_is_rejected() {
+        let mut engines = setup_engines(4);
+        round_robin(&mut engines);
+
+        let (mut block, _) = engines[0].build_block();
+        // Someone who is not a validator at all, wearing the leader's slot.
+        block.header.proposer = Address::from_public_key(&generate_signing_key().verifying_key());
+
+        assert!(
+            engines[0].validate_and_vote(&block).is_none(),
+            "a proposer outside the validator set must not be voted on"
+        );
+    }
+
+    #[test]
+    fn a_missing_vrf_proof_is_rejected_when_vrf_is_required() {
+        let engines = setup_engines(4);
+        // setup_engines leaves skip_vrf = false, i.e. VRF is REQUIRED here.
+        let (mut block, _) = engines[0].build_block();
+        assert!(block.vrf_proof.is_some(), "VRF mode must produce a proof");
+        block.vrf_proof = None;
+
+        assert!(
+            engines[0].validate_and_vote(&block).is_none(),
+            "with VRF required, an absent proof must be a decision, not a skip"
+        );
+    }
+
+    // CONTROL: the legitimate leader must still be voted on. Without this the
+    // three tests above pass just as well against a node that votes on nothing,
+    // which halts the chain.
+    #[test]
+    fn the_round_leader_is_still_accepted() {
+        let mut engines = setup_engines(4);
+        round_robin(&mut engines);
+
+        let (block, _) = engines[0].build_block();
+        assert!(
+            engines[1].validate_and_vote(&block).is_some(),
+            "the round-0 leader's proposal must still be accepted"
+        );
+    }
+
+    // CONTROL: and the VRF path, which every other test in this file exercises,
+    // must be unaffected -- a proposal carrying a valid proof is still accepted.
+    #[test]
+    fn a_valid_vrf_proposal_is_still_accepted() {
+        let engines = setup_engines(4);
+        let (block, _) = engines[0].build_block();
+        assert!(block.vrf_proof.is_some());
+        assert!(
+            engines[1].validate_and_vote(&block).is_some(),
+            "a valid VRF proposal must still be accepted"
+        );
     }
 
     /// A round-0 QC must be ADOPTED as highest_qc. The old unwrap_or(0)

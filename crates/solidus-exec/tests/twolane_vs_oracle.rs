@@ -36,6 +36,7 @@ fn ctx_at(height: u64) -> BlockCtx<'static> {
         height,
         timestamp_ms: GENESIS_TS + height * 1_000,
         network: NETWORK,
+        parent_state_root: [0u8; 32],
     }
 }
 
@@ -92,7 +93,7 @@ fn randomized_v2_streams_zero_divergence() {
     let blocks = env_usize("SOLIDUS_TWOLANE_BLOCKS", 40);
     let max_txs = env_usize("SOLIDUS_TWOLANE_TXS", 48);
     let offset = env_usize("SOLIDUS_TWOLANE_SEED_OFFSET", 0);
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
 
     let mut total_txs = 0u64;
     for seed_idx in offset..offset + seeds {
@@ -137,7 +138,7 @@ fn run_both(
     txs: &[Transaction],
     height: u64,
 ) -> (BlockOutcome, BlockOutcome) {
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
     let ctx = ctx_at(height);
     let oracle = execute_block_reference(baseline, txs, &ctx, &opts).expect("oracle");
     let twolane = execute_block_twolane(baseline, txs, &ctx, &opts).expect("twolane");
@@ -276,7 +277,7 @@ fn adversarial_hot_issuer_burst_with_payment_traffic() {
     let issuer = generate_signing_key();
     let issuer_pk = issuer.verifying_key().to_bytes();
     let mut height = 1u64;
-    let opts = ExecOptions::v2_defaults();
+    let opts = ExecOptions::v2_defaults(50_002);
     let reg = sign_tx_mode(
         &issuer,
         0,
@@ -403,7 +404,7 @@ fn adversarial_fee_settlement_width_burn_policy() {
 fn over_cap_identity_lane_rejected_by_both() {
     let mut baseline = InMemoryState::new();
     let m = WireMode::BinaryV2;
-    let mut opts = ExecOptions::v2_defaults();
+    let mut opts = ExecOptions::v2_defaults(50_002);
     opts.identity_cap = 2;
 
     let staker = generate_signing_key();

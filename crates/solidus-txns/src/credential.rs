@@ -35,6 +35,13 @@ mod serde_bytes_96_opt {
 // ---------------------------------------------------------------------------
 
 /// The type of a verifiable credential issued on-chain.
+///
+/// The agent-identity variants (`OwnerBinding`/`CapabilityScope`/`SpendMandate`,
+/// added 2026-07-14) carry `serde(alias)` for the snake_case strings the
+/// published `@solidus-network/agent-identity` SDK puts on the wire — the live
+/// backend's `CredentialIssueBbs` txs were rejected with serde's
+/// `unknown variant \`owner_binding\`` until the chain knew them. Records
+/// serialize PascalCase like every other variant; only input accepts both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CredentialType {
     Email,
@@ -44,6 +51,20 @@ pub enum CredentialType {
     KycL3,
     Age,
     Reputation,
+    /// Binds an AI agent's DID to its operator's DID (agent-identity Flow B).
+    #[serde(alias = "owner_binding")]
+    OwnerBinding,
+    /// The capability scopes an agent is authorized for.
+    #[serde(alias = "capability_scope")]
+    CapabilityScope,
+    /// A bounded spending mandate delegated to an agent.
+    #[serde(alias = "spend_mandate")]
+    SpendMandate,
+    /// Accreditation of an issuer DID by a bridge trust root (bridge phase 0b).
+    /// Accepted only at ProtocolVersion::V2, only through `CredentialIssue`
+    /// (the subject is an organisation's DID, published on purpose).
+    #[serde(alias = "accredited_issuer")]
+    AccreditedIssuer,
 }
 
 impl CredentialType {
@@ -58,6 +79,14 @@ impl CredentialType {
             CredentialType::KycL3 => 2_000_000_000,  // 20.0 SLDS
             CredentialType::Age => 5_000_000,        // 0.05 SLDS
             CredentialType::Reputation => 1_000_000, // 0.01 SLDS
+            // Agent credentials price at the Age tier: high-volume,
+            // machine-issued, no human-verification cost behind them.
+            // Mandates carry financial delegation — 2× that.
+            CredentialType::OwnerBinding => 5_000_000, // 0.05 SLDS
+            CredentialType::CapabilityScope => 5_000_000, // 0.05 SLDS
+            CredentialType::SpendMandate => 10_000_000, // 0.1 SLDS
+            // Issuance is fee-exempt in both executors, so this is never charged.
+            CredentialType::AccreditedIssuer => 0,
         }
     }
 
@@ -86,7 +115,18 @@ pub struct CredentialRecord {
     /// DID of the entity that issued this credential.
     pub issuer_did: String,
     /// DID of the entity the credential was issued to.
+    ///
+    /// ⚠ EMPTY for a BD-6b (v2) record, where the subject is committed to rather
+    /// than published. Read `subject_commitment` instead. It stays a `String` and
+    /// not an `Option` so every existing v1 record deserialises unchanged.
     pub subject_did: String,
+    /// Commitment to the subject DID (BD-6b, v2 only). `None` for v1 records.
+    ///
+    /// `BLAKE3(SUBJECT_COMMITMENT_DOMAIN ‖ subject_did ‖ nonce32)`. Additive and
+    /// `skip_serializing_if`, mirroring `bbs_pubkey`, so v1 records neither carry the
+    /// field nor change shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_commitment: Option<[u8; 32]>,
     /// The type of credential.
     pub credential_type: CredentialType,
     /// BLAKE3 hash of the off-chain credential payload.
@@ -161,6 +201,34 @@ pub enum CredentialError {
 // ID builder
 // ---------------------------------------------------------------------------
 
+/// Domain separator for the subject commitment. Versioned so a future scheme
+/// change cannot be confused with this one.
+pub const SUBJECT_COMMITMENT_DOMAIN: &[u8] = b"solidus.cred.subject.v1";
+
+/// Commit to a subject DID without publishing it.
+///
+/// `BLAKE3(domain ‖ subject_did ‖ nonce)`. The issuer draws `nonce` from a CSPRNG
+/// once per credential and hands `(subject_did, nonce)` to the holder off-chain
+/// alongside the credential. The chain stores only the output.
+///
+/// **The nonce is the entire point, not decoration.** Without it the commitment is
+/// `BLAKE3(domain ‖ subject_did)` over a candidate set an observer can enumerate
+/// from public `DidCreate` transactions, which is the same confirmation oracle that
+/// `credential_id_leaks_the_subject_by_brute_force` demonstrates against the current
+/// ID derivation. 32 bytes of per-credential entropy is what makes the search
+/// infeasible rather than merely tedious.
+///
+/// NOT WIRED. This is preparation for the `subject_did` removal and nothing calls
+/// it yet; landing that change is a founder decision (BD-7 scope).
+pub fn build_subject_commitment(subject_did: &str, nonce: &[u8; 32]) -> [u8; 32] {
+    let mut input =
+        Vec::with_capacity(SUBJECT_COMMITMENT_DOMAIN.len() + subject_did.len() + nonce.len());
+    input.extend_from_slice(SUBJECT_COMMITMENT_DOMAIN);
+    input.extend_from_slice(subject_did.as_bytes());
+    input.extend_from_slice(nonce);
+    blake3_hash(&input)
+}
+
 /// Build a deterministic credential ID from issuer, subject, hash, and block height.
 ///
 /// Format: `urn:solidus:credential:<BLAKE3(issuer || subject || hash || height_le)>`
@@ -210,6 +278,91 @@ pub fn execute_credential_issue(
         id,
         issuer_did: issuer_did.to_string(),
         subject_did: subject_did.to_string(),
+        subject_commitment: None,
+        credential_type,
+        hash,
+        issued_ms: timestamp_ms,
+        revoked: false,
+        revoked_ms: None,
+        bbs_pubkey: None,
+        bbs_message_count: None,
+    })
+}
+
+/// Build a v2 credential ID from the subject COMMITMENT rather than the subject DID.
+///
+/// Same construction as [`build_credential_id`], with the commitment in the subject's
+/// place. That substitution is the entire fix: the v1 id is brute-forceable because
+/// issuer, `hash` and height are all public and only the subject is unknown, so one
+/// BLAKE3 per candidate DID identifies it. The commitment carries 32 bytes of
+/// per-credential entropy the chain never sees, so the same search has nothing to
+/// enumerate. See `credential_id_leaks_the_subject_by_brute_force` and
+/// `subject_commitment_defeats_the_brute_force`.
+pub fn build_credential_id_v2(
+    issuer_did: &str,
+    subject_commitment: &[u8; 32],
+    hash: &[u8; 32],
+    height: u64,
+) -> String {
+    let mut input = Vec::with_capacity(issuer_did.len() + 32 + 32 + 8);
+    input.extend_from_slice(issuer_did.as_bytes());
+    input.extend_from_slice(subject_commitment);
+    input.extend_from_slice(hash);
+    input.extend_from_slice(&height.to_le_bytes());
+    format!(
+        "urn:solidus:credential:{}",
+        hex::encode(blake3_hash(&input))
+    )
+}
+
+/// The `CF_CRED_BY_SUBJECT` key for a v2 credential.
+///
+/// v1 keys that column family by DID string, v2 by lowercase hex of the commitment.
+/// **They cannot collide**: a DID key always begins `did:`, and hex is `[0-9a-f]` only.
+/// The encoding lives here rather than in an executor so both chains agree on the key
+/// format by construction, instead of by two implementations happening to match.
+///
+/// An observer cannot compute this key without the issuer's nonce, so the index stays
+/// useful to a holder who knows their own commitments and useless for enumeration.
+pub fn subject_commitment_index_key(subject_commitment: &[u8; 32]) -> String {
+    hex::encode(subject_commitment)
+}
+
+/// Execute a `CredentialIssueV2` operation (Rebuild #2 BD-6b, v2 chain only).
+///
+/// ⚠ **There is no `subject_did_active` parameter, and that is a deliberate loss.**
+/// v1 rejects issuance to a missing or deactivated subject via
+/// [`CredentialError::SubjectDidInvalid`], resolving the subject with `load_did`. With
+/// a commitment the chain cannot resolve the subject at all, so the check cannot run.
+/// **Founder decision, 2026-08-21: drop it and document it.** The mitigation is that
+/// such a credential is inert, because nobody holds the matching key and the holder
+/// cannot present what they were never given. The stronger answer, recorded if issuance
+/// ever becomes adversarial, is a subject co-signature on the transaction, which would
+/// prove existence *and* consent rather than existence alone, at the cost of a
+/// two-party transaction format.
+///
+/// The issuer check is UNCHANGED: an inactive issuer still fails.
+pub fn execute_credential_issue_v2(
+    issuer_did: &str,
+    subject_commitment: [u8; 32],
+    credential_type: CredentialType,
+    hash: [u8; 32],
+    issuer_did_active: bool,
+    block_height: u64,
+    timestamp_ms: u64,
+) -> Result<CredentialRecord, CredentialError> {
+    if !issuer_did_active {
+        return Err(CredentialError::IssuerDidInvalid);
+    }
+
+    let id = build_credential_id_v2(issuer_did, &subject_commitment, &hash, block_height);
+    Ok(CredentialRecord {
+        id,
+        issuer_did: issuer_did.to_string(),
+        // Empty, not a placeholder DID: anything DID-shaped here would be a lie that
+        // reads as data downstream.
+        subject_did: String::new(),
+        subject_commitment: Some(subject_commitment),
         credential_type,
         hash,
         issued_ms: timestamp_ms,
@@ -234,6 +387,7 @@ pub fn execute_credential_issue(
 ///
 /// The on-chain record commits to the issuer's BBS pubkey + the off-chain
 /// payload hash; verifying actual proofs is done via RPC, not on-chain.
+#[cfg(feature = "bbs")]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_credential_issue_bbs(
     issuer_did: &str,
@@ -270,6 +424,7 @@ pub fn execute_credential_issue_bbs(
         id,
         issuer_did: issuer_did.to_string(),
         subject_did: subject_did.to_string(),
+        subject_commitment: None,
         credential_type,
         hash,
         issued_ms: timestamp_ms,
@@ -329,6 +484,7 @@ mod tests {
             id: "urn:solidus:credential:aabbcc".to_string(),
             issuer_did: "did:solidus:testnet:issuer".to_string(),
             subject_did: "did:solidus:testnet:subject".to_string(),
+            subject_commitment: None,
             credential_type: CredentialType::KycL1,
             hash: sample_hash(),
             issued_ms: 1_000_000,
@@ -340,6 +496,7 @@ mod tests {
     }
 
     /// Helper: produce a valid BBS+ pubkey (96 bytes) for tests.
+    #[cfg(feature = "bbs")]
     fn sample_bbs_pubkey() -> [u8; 96] {
         use solidus_crypto::bbs::BbsSecretKey;
         let sk =
@@ -373,6 +530,233 @@ mod tests {
         assert_eq!(id1, id2);
     }
 
+    /// ⛔ The credential ID is a CONFIRMATION ORACLE for the subject DID.
+    ///
+    /// `BLAKE3(issuer || subject || hash || height)` is not invertible, but that is
+    /// not the property that matters here: **every other input is public.** The
+    /// issuer is derived from the sender address in the signed transaction, `hash`
+    /// is a field of the payload, and the height is the block the tx landed in. So
+    /// an observer holding a candidate DID needs exactly one hash to test it.
+    ///
+    /// And candidates are not scarce. Every DID reaches the chain through a
+    /// `DidCreate` transaction in a public block, so the candidate set is simply
+    /// "every DID on the ledger", and identifying the subject of any credential
+    /// costs one BLAKE3 per candidate.
+    ///
+    /// **This is why removing `subject_did` from `CredentialIssue` is NOT sufficient
+    /// on its own.** The ID derivation has to change with it, or the field comes
+    /// straight back out of the identifier that replaces it. Recorded as a test
+    /// rather than a comment so the claim is checkable and so it fails loudly if
+    /// someone changes the derivation and believes the problem is solved.
+    /// The commitment defeats the brute force that the ID derivation does not.
+    ///
+    /// Same attacker, same public inputs, same candidate set as
+    /// `credential_id_leaks_the_subject_by_brute_force`. The only change is that the
+    /// subject reaches the chain as `build_subject_commitment(did, nonce)` instead of
+    /// as itself. The search now fails, because reproducing the commitment requires
+    /// the nonce and the nonce never reaches the chain.
+    /// ⛔ THE ASSERTION THE PLAN'S VERIFICATION TABLE ASKS FOR: no `subject_did`
+    /// reaches a v2 record.
+    ///
+    /// Row 4 of the plan demanded "a test asserting no `subject_did` reaches any
+    /// payload". This is it, and it checks the RECORD rather than the payload, because
+    /// the record is what gets written to disk and served by RPC.
+    #[test]
+    fn v2_record_carries_no_subject_did() {
+        let commitment = build_subject_commitment("did:solidus:testnet:alice", &[9u8; 32]);
+        let cred = execute_credential_issue_v2(
+            "did:solidus:testnet:issuer",
+            commitment,
+            CredentialType::KycL3,
+            sample_hash(),
+            true,
+            42,
+            1_700_000_000_000,
+        )
+        .expect("an active issuer must succeed");
+
+        assert!(
+            cred.subject_did.is_empty(),
+            "v2 must not carry a subject DID"
+        );
+        assert_eq!(cred.subject_commitment, Some(commitment));
+        // The id must not leak it either: same construction, commitment in the
+        // subject's place.
+        assert_eq!(
+            cred.id,
+            build_credential_id_v2(
+                "did:solidus:testnet:issuer",
+                &commitment,
+                &sample_hash(),
+                42
+            )
+        );
+        // CONTROL: the v1 path still DOES carry the DID, so the assertion above is
+        // detecting the v2 behaviour rather than a field that is always empty.
+        let v1 = execute_credential_issue(
+            "did:solidus:testnet:issuer",
+            "did:solidus:testnet:alice",
+            CredentialType::KycL3,
+            sample_hash(),
+            true,
+            true,
+            42,
+            1_700_000_000_000,
+        )
+        .expect("v1 happy path");
+        assert_eq!(v1.subject_did, "did:solidus:testnet:alice");
+        assert_eq!(v1.subject_commitment, None);
+    }
+
+    /// The dropped subject check is a DECISION, and this pins it so nobody restores it
+    /// by accident or removes the issuer check by symmetry.
+    #[test]
+    fn v2_drops_the_subject_check_but_keeps_the_issuer_check() {
+        let commitment = build_subject_commitment("did:solidus:testnet:nobody", &[1u8; 32]);
+
+        // No subject exists, and there is no way to say so: issuance succeeds.
+        // Founder decision 2026-08-21. Such a credential is inert, because nobody holds
+        // the matching key.
+        assert!(execute_credential_issue_v2(
+            "did:solidus:testnet:issuer",
+            commitment,
+            CredentialType::Age,
+            sample_hash(),
+            true,
+            1,
+            1,
+        )
+        .is_ok());
+
+        // The ISSUER check is untouched.
+        assert!(matches!(
+            execute_credential_issue_v2(
+                "did:solidus:testnet:issuer",
+                commitment,
+                CredentialType::Age,
+                sample_hash(),
+                false,
+                1,
+                1,
+            ),
+            Err(CredentialError::IssuerDidInvalid)
+        ));
+    }
+
+    /// v1 and v2 index keys share one column family and must not collide.
+    /// ⛔ FROZEN CROSS-LANGUAGE VECTOR. Do not "fix" this value.
+    ///
+    /// `@solidus/sdk` computes the same commitment in TypeScript so an issuer can build
+    /// the payload off-chain, and the two must agree **byte for byte** or a credential
+    /// issued by the SDK commits to something the chain cannot reproduce. That failure
+    /// is silent: the tx succeeds, the record is written, and the holder can never
+    /// prove the credential is theirs.
+    ///
+    /// The identical constant is asserted in
+    /// `packages/@solidus/sdk/src/__tests__/subject-commitment.test.ts`. Changing the
+    /// domain separator, the field order or the hash breaks both, which is the point.
+    #[test]
+    fn subject_commitment_matches_the_frozen_typescript_vector() {
+        assert_eq!(
+            hex::encode(build_subject_commitment(
+                "did:solidus:testnet:alice",
+                &[0x5au8; 32]
+            )),
+            "67965a0e413eb538eb35ff98d665325e49be142f7ee4676bfcfcc418eb45d6df"
+        );
+    }
+
+    #[test]
+    fn index_keys_cannot_collide_between_v1_and_v2() {
+        let key =
+            subject_commitment_index_key(&build_subject_commitment("did:solidus:x", &[0u8; 32]));
+        assert_eq!(key.len(), 64, "32 bytes as lowercase hex");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            !key.starts_with("did:"),
+            "a v2 key must never look like a v1 DID key"
+        );
+    }
+
+    #[test]
+    fn subject_commitment_defeats_the_brute_force() {
+        let candidates: Vec<String> = (0..500)
+            .map(|i| format!("did:solidus:testnet:subject{i}"))
+            .collect();
+        let real_subject = &candidates[317];
+        let nonce = [0x5au8; 32]; // stands in for a CSPRNG draw; secrecy is what matters
+
+        let published = build_subject_commitment(real_subject, &nonce);
+
+        // The attacker knows every candidate and the scheme, but not the nonce.
+        let recovered = candidates
+            .iter()
+            .find(|c| build_subject_commitment(c, &[0u8; 32]) == published);
+        assert!(
+            recovered.is_none(),
+            "the subject must not be recoverable without the nonce"
+        );
+
+        // CONTROL 1: the search is real. Given the nonce, the same loop finds it,
+        // so the failure above is the missing nonce and not a broken comparison.
+        let with_nonce = candidates
+            .iter()
+            .find(|c| build_subject_commitment(c, &nonce) == published);
+        assert_eq!(
+            with_nonce.map(String::as_str),
+            Some(real_subject.as_str()),
+            "with the nonce the holder can still prove which subject this is"
+        );
+
+        // CONTROL 2: two credentials for the SAME subject under different nonces do
+        // not link. This is the property the ledger needs and the raw DID never had.
+        let a = build_subject_commitment(real_subject, &[1u8; 32]);
+        let b = build_subject_commitment(real_subject, &[2u8; 32]);
+        assert_ne!(
+            a, b,
+            "same subject under different nonces must not be linkable"
+        );
+    }
+
+    #[test]
+    fn credential_id_leaks_the_subject_by_brute_force() {
+        let issuer = "did:solidus:testnet:issuer";
+        let hash = sample_hash();
+        let height = 42u64;
+
+        // The candidate set an observer builds by scanning DidCreate txs.
+        let candidates: Vec<String> = (0..500)
+            .map(|i| format!("did:solidus:testnet:subject{i}"))
+            .collect();
+        let real_subject = &candidates[317];
+
+        // What the chain publishes.
+        let published_id = build_credential_id(issuer, real_subject, &hash, height);
+
+        // The whole attack: one hash per candidate, using only public inputs.
+        let recovered = candidates
+            .iter()
+            .find(|c| build_credential_id(issuer, c, &hash, height) == published_id);
+
+        assert_eq!(
+            recovered.map(String::as_str),
+            Some(real_subject.as_str()),
+            "the subject must be recoverable, or this test has stopped describing the system"
+        );
+
+        // CONTROL: the search is doing real work, not passing trivially. A subject
+        // outside the candidate set is NOT found, which is what distinguishes a
+        // genuine search from an assertion that always succeeds.
+        let absent_id =
+            build_credential_id(issuer, "did:solidus:testnet:not-in-set", &hash, height);
+        assert!(
+            candidates
+                .iter()
+                .all(|c| build_credential_id(issuer, c, &hash, height) != absent_id),
+            "a subject outside the candidate set must not match anything in it"
+        );
+    }
+
     #[test]
     fn build_credential_id_differs_by_input() {
         let issuer = "did:solidus:testnet:issuer";
@@ -397,6 +781,39 @@ mod tests {
         assert_eq!(CredentialType::KycL3.issue_fee(), 2_000_000_000);
         assert_eq!(CredentialType::Age.issue_fee(), 5_000_000);
         assert_eq!(CredentialType::Reputation.issue_fee(), 1_000_000);
+        assert_eq!(CredentialType::OwnerBinding.issue_fee(), 5_000_000);
+        assert_eq!(CredentialType::CapabilityScope.issue_fee(), 5_000_000);
+        assert_eq!(CredentialType::SpendMandate.issue_fee(), 10_000_000);
+    }
+
+    /// The exact live failure of 2026-07-13: the published agent-identity SDK
+    /// sends snake_case type strings inside CredentialIssueBbs tx JSON, and
+    /// the chain rejected them with `unknown variant \`owner_binding\``.
+    /// The aliases must accept the wire form; records keep PascalCase.
+    #[test]
+    fn agent_credential_types_accept_sdk_wire_form() {
+        for (wire, expected) in [
+            ("owner_binding", CredentialType::OwnerBinding),
+            ("capability_scope", CredentialType::CapabilityScope),
+            ("spend_mandate", CredentialType::SpendMandate),
+        ] {
+            let parsed: CredentialType =
+                serde_json::from_str(&format!("\"{wire}\"")).expect("snake_case alias");
+            assert_eq!(parsed, expected);
+        }
+        // PascalCase (the record form) round-trips unchanged.
+        let json = serde_json::to_string(&CredentialType::OwnerBinding).expect("ser");
+        assert_eq!(json, "\"OwnerBinding\"");
+        let back: CredentialType = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, CredentialType::OwnerBinding);
+    }
+
+    #[test]
+    fn agent_credential_record_roundtrip() {
+        let mut record = sample_record();
+        record.credential_type = CredentialType::SpendMandate;
+        let decoded = CredentialRecord::from_bytes(&record.to_bytes()).expect("roundtrip");
+        assert_eq!(decoded.credential_type, CredentialType::SpendMandate);
     }
 
     // -----------------------------------------------------------------------
@@ -540,6 +957,7 @@ mod tests {
     // execute_credential_issue_bbs tests
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "bbs")]
     #[test]
     fn issue_bbs_credential_success() {
         let pk = sample_bbs_pubkey();
@@ -562,6 +980,7 @@ mod tests {
         assert_eq!(record.credential_type, CredentialType::KycL2);
     }
 
+    #[cfg(feature = "bbs")]
     #[test]
     fn issue_bbs_credential_invalid_pubkey() {
         let bad_pk = [0u8; 96]; // not a valid G2 point
@@ -581,6 +1000,7 @@ mod tests {
         assert_eq!(err, CredentialError::InvalidBbsKey);
     }
 
+    #[cfg(feature = "bbs")]
     #[test]
     fn issue_bbs_credential_zero_message_count() {
         let err = execute_credential_issue_bbs(
@@ -599,6 +1019,7 @@ mod tests {
         assert_eq!(err, CredentialError::BbsMessageCountZero);
     }
 
+    #[cfg(feature = "bbs")]
     #[test]
     fn issue_bbs_credential_message_count_too_large() {
         let err = execute_credential_issue_bbs(
@@ -623,6 +1044,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bbs")]
     #[test]
     fn issue_bbs_credential_issuer_inactive() {
         let err = execute_credential_issue_bbs(
@@ -641,6 +1063,7 @@ mod tests {
         assert_eq!(err, CredentialError::IssuerDidInvalid);
     }
 
+    #[cfg(feature = "bbs")]
     #[test]
     fn revoke_bbs_credential_success() {
         let pk = sample_bbs_pubkey();
@@ -678,5 +1101,26 @@ mod tests {
         assert_eq!(CredentialType::KycL1.issue_fee_bbs(), 125_000_000);
         assert_eq!(CredentialType::KycL2.issue_fee_bbs(), 625_000_000);
         assert_eq!(CredentialType::KycL3.issue_fee_bbs(), 2_500_000_000);
+    }
+
+    #[test]
+    fn accredited_issuer_is_appended_with_a_stable_serde_name_and_index() {
+        assert_eq!(
+            serde_json::to_value(CredentialType::AccreditedIssuer).unwrap(),
+            serde_json::json!("AccreditedIssuer")
+        );
+        assert_eq!(
+            serde_json::from_str::<CredentialType>("\"accredited_issuer\"").unwrap(),
+            CredentialType::AccreditedIssuer
+        );
+        // bincode writes the declaration index as u32 LE; 10 means appended after SpendMandate (9).
+        assert_eq!(
+            bincode::serialize(&CredentialType::AccreditedIssuer).unwrap(),
+            10u32.to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            bincode::serialize(&CredentialType::SpendMandate).unwrap(),
+            9u32.to_le_bytes().to_vec()
+        );
     }
 }

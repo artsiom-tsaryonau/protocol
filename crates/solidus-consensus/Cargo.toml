@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-solidus-crypto.workspace = true
+solidus-crypto = { workspace = true, features = ["consensus"] }
 solidus-txns.workspace = true
 solidus-state.workspace = true
 serde.workspace = true

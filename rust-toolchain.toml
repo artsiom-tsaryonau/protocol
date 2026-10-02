@@ -1,4 +1,21 @@
+# Pinned to STABLE, deliberately, and this file is the reason the Rust CI jobs were not
+# reproducible before 2026-08-17.
+#
+# It used to say `channel = "nightly"` while .github/workflows/ci.yml installs
+# dtolnay/rust-toolchain@stable. rustup honours THIS FILE over the workflow, so CI asked for
+# stable and silently ran nightly — a channel that moves every day, meaning a green build could
+# turn red overnight with no code change.
+#
+# Measured before switching, rather than assumed:
+#   · 0 files use `#![feature(...)]` — no nightly-only language features (145 .rs files scanned,
+#     control: 125 contain `fn `, so the probe was not silently matching nothing)
+#   · `cargo +stable check --workspace` exits 0
+#   · fmt, clippy and `cargo test --workspace` all exit 0 on stable (557 passed, 0 failed)
+#
+# ⚠ If you ever need nightly again, pin a DATED nightly (`channel = "nightly-2026-08-17"`) rather
+# than the moving channel, and change the workflow to match. Never leave the two disagreeing.
+
 [toolchain]
-channel = "nightly"
+channel = "stable"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]

@@ -138,12 +138,14 @@ async fn create_did_and_resolve_via_rpc() {
     assert_eq!(doc["id"], did_str, "DID id mismatch");
     assert_eq!(doc["active"], true, "DID should be active");
     assert_eq!(
-        doc["context"], "https://www.w3.org/ns/did/v1",
-        "DID context should be W3C DID v1"
+        doc["@context"], "https://www.w3.org/ns/did/v1",
+        "DID Core spells the context property `@context`"
     );
 
-    // The RPC struct field is `verification_method` (snake_case, no rename).
-    let vm_array = doc["verification_method"]
+    // ⚠ CHANGED 2026-08-25: the RPC struct now carries `rename_all = "camelCase"`, so this is
+    // `verificationMethod`. The old spelling was not a style choice — DID Core defines the JSON
+    // property names, and this is an END-TO-END assertion that the rename reached the wire.
+    let vm_array = doc["verificationMethod"]
         .as_array()
         .expect("verification_method should be an array");
     assert!(
@@ -216,6 +218,10 @@ async fn version_id_visible_via_rpc() {
         .expect("solidus_didResolve failed");
     let doc = result.expect("DID document should be present after creation");
 
+    // ⚠ BACK TO `version_id` 2026-08-25, and the flip-flop is the finding. A blanket
+    // `rename_all = "camelCase"` briefly renamed this to `versionId`. `versionId` is not a DID Core
+    // property — it is our own extension — so renaming it bought no conformance and broke every
+    // published SDK that reads it. Only the DID Core names are camelCase now.
     let version_id = doc["version_id"]
         .as_str()
         .expect("version_id must be a string");

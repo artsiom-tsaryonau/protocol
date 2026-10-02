@@ -47,6 +47,10 @@ pub fn generate(dir: &str, n: usize, chain_id: u64) -> Result<()> {
         .map(|i| ValidatorEntry {
             index: i as u32,
             bls_pubkey_hex: hex::encode(bls[i].public_key().to_bytes()),
+            bls_pop_hex: Some(hex::encode(bls[i].prove_possession().to_bytes())),
+            // A generated devnet config does not mint attestation keys: those are deployed from
+            // the sops store onto the chain box, never written into a config a script produced.
+            attestation_address: None,
         })
         .collect();
 
@@ -77,6 +81,7 @@ pub fn generate(dir: &str, n: usize, chain_id: u64) -> Result<()> {
             data_dir: format!("{dir}/data-node{i}"),
             rpc_addr: format!("127.0.0.1:{}", BASE_RPC_PORT + i),
             listen_addr: listen_addrs[i].clone(),
+            bridge_attestation_secret_hex: None,
             bls_secret_hex: hex::encode(bls[i].to_bytes()),
             p2p_secret_hex: hex::encode(p2p_seeds[i]),
             validators: validators.clone(),
@@ -139,6 +144,10 @@ pub fn keygen() -> Result<()> {
     println!(
         "bls_pubkey_hex = \"{}\"",
         hex::encode(bls.public_key().to_bytes())
+    );
+    println!(
+        "bls_pop_hex = \"{}\"",
+        hex::encode(bls.prove_possession().to_bytes())
     );
     println!("peer_id = \"{}\"", kp.public().to_peer_id());
     Ok(())
@@ -230,5 +239,25 @@ mod tests {
             "n=3 is below the BFT minimum"
         );
         assert!(generate(path, 1, 1).is_err(), "n=1 self-recurses");
+    }
+
+    #[test]
+    fn generated_validators_carry_a_verifying_proof_of_possession() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_str().unwrap();
+        generate(path, 4, 31337).expect("generate");
+        let t = std::fs::read_to_string(format!("{path}/node0.toml")).expect("read");
+        let cfg: DaemonConfig = toml::from_str(&t).expect("parse");
+        for v in &cfg.validators {
+            let pk = solidus_crypto::bls::BlsPublicKey::from_hex(&v.bls_pubkey_hex).unwrap();
+            let pop_hex = v.bls_pop_hex.as_ref().expect("gen writes a pop");
+            let bytes: [u8; 96] = hex::decode(pop_hex).unwrap().try_into().unwrap();
+            let pop = solidus_crypto::bls::BlsSignature::from_bytes(&bytes).unwrap();
+            assert!(
+                pk.verify_possession(&pop),
+                "validator {} pop must verify",
+                v.index
+            );
+        }
     }
 }

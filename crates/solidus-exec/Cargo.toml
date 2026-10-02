@@ -7,12 +7,14 @@ repository.workspace = true
 description = "Solidus v2 two-lane executor: serial reference oracle, lane partition, delta/fee machinery"
 
 [dependencies]
-solidus-txns = { workspace = true }
-solidus-crypto = { workspace = true }
+solidus-txns = { workspace = true, features = ["bbs"] }
+solidus-crypto = { workspace = true, features = ["attest", "bbs"] }
 solidus-state-tree = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }
+solidus-bridge-codec = { workspace = true }
+k256 = { version = "0.13", features = ["ecdsa"] }
 thiserror = { workspace = true }
 ed25519-dalek = { workspace = true }
 rayon = { workspace = true }
@@ -29,3 +31,7 @@ hex = { workspace = true }
 [[bench]]
 name = "executor"
 harness = false
+
+[features]
+# Test builds only: V2 activates at height 1_000. solidus-noded refuses to start with it.
+test-activation-schedule = []

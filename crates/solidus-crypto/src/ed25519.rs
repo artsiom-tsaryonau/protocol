@@ -9,13 +9,21 @@ pub fn sign(key: &SigningKey, message: &[u8]) -> [u8; 64] {
 /// Verify an Ed25519 signature against a message and verifying key.
 /// Returns `true` if the signature is valid.
 ///
-/// Uses `verify_strict` so identity / small-order public keys and
-/// malleable signatures are rejected — non-strict verify can accept
-/// the all-zeros pubkey + all-zeros sig pair (the vacuous identity
-/// equation), which is a real chain-level bug if an attacker submits
-/// a tx with `sender_pubkey = [0; 32]`. Strict verification closes
-/// this and matches what every production ed25519 deployment should
-/// use.
+/// Uses `verify_strict`, which rejects identity / small-order public keys
+/// and enforces a canonical `S`, giving SBS (exclusive ownership).
+///
+/// ⚠ CORRECTED 2026-08-25 — this comment used to say non-strict `verify`
+/// "can accept the all-zeros pubkey + all-zeros sig pair". MEASURED, that
+/// is false HERE: seeding `verify_strict` -> `verify` in this function
+/// leaves `rejects_all_zero_key_and_signature` PASSING, because dalek's
+/// non-strict path still rejects that pair on the verification equation.
+/// The claim is true of a COFACTORED verifier, which dalek is not and
+/// @noble/ed25519 (`{ zip215: true }`, its default) is — that is exactly
+/// how the TypeScript half shipped without SBS until 2026-08-25.
+///
+/// So keep `verify_strict` for the property it really provides — small-order
+/// key rejection and non-malleability in general — not for this one vector,
+/// which cofactorless arithmetic already refuses.
 pub fn verify(key: &VerifyingKey, message: &[u8], signature: &[u8; 64]) -> bool {
     let sig = Signature::from_bytes(signature);
     key.verify_strict(message, &sig).is_ok()
@@ -30,6 +38,32 @@ pub fn generate_signing_key() -> SigningKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Cross-language pin: `@solidus/jwt`'s ed25519-strict.test.ts asserts THE SAME PAIR on
+    // the TypeScript side, where it is ACCEPTED under @noble's ZIP-215 default and rejected
+    // once `{ zip215: false }` is passed. Both languages must reject it.
+    //
+    // ⚠ This test does NOT discriminate strict from non-strict in Rust — measured, it passes
+    // under both. It is a regression pin on the OUTCOME, and the cross-language half of the
+    // vector the TypeScript fix was built on. Do not read it as proof `verify_strict` is wired.
+    #[test]
+    fn rejects_all_zero_key_and_signature() {
+        // An all-zero verifying key is the identity point: a small-order key. Paired with an
+        // all-zero signature it satisfies the verification equation vacuously under the
+        // cofactored (ZIP-215) rule, for ANY message.
+        let key = VerifyingKey::from_bytes(&[0u8; 32])
+            .expect("the identity point is a well-formed encoding — that is the whole problem");
+        for message in [
+            b"solidus protocol".as_slice(),
+            b"".as_slice(),
+            b"any message at all",
+        ] {
+            assert!(
+                !verify(&key, message, &[0u8; 64]),
+                "verify_strict must reject the all-zero key/signature pair"
+            );
+        }
+    }
 
     #[test]
     fn sign_and_verify_roundtrip() {

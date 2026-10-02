@@ -4,7 +4,7 @@
 //! Apache-2.0) which implements the IRTF draft `draft-irtf-cfrg-bbs-signatures`
 //! over BLS12-381. The ciphersuite pinned here is `BLS12-381-SHA-256` per the
 //! draft. This module exposes a Solidus-shaped API mirroring the conventions of
-//! [`crate::bls`].
+//! the `bls` module (behind the `consensus` feature).
 //!
 //! Status: testnet-grade. External audit is pending and tracked under the
 //! NLnet NGI Zero proposal. Do NOT use this for production-grade key material

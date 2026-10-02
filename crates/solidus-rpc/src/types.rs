@@ -111,21 +111,40 @@ impl RpcReceipt {
 // ---------------------------------------------------------------------------
 
 /// JSON-friendly representation of a DID document.
+///
+/// ⚠ THE PROPERTY NAMES ARE PART OF THE SPECIFICATION, NOT A STYLE CHOICE. `did:solidus` is
+/// registered in the W3C DID Method Registry and the registry entry points at a specification
+/// declaring `Ed25519VerificationKey2020`. The JSON representation of DID Core is camelCase and
+/// spells the context property `@context`. This struct carried NO serde renames until 2026-08-25,
+/// so every field shipped under its Rust name and the documents we served did not conform to the
+/// suite they named.
+/// ⚠ SERIALISED UNDER BOTH NAMINGS, AND `rename_all` WAS THE WRONG TOOL. The 2026-08-25 conformance
+/// fix put `rename_all = "camelCase"` on the whole struct, which renamed our OWN extension fields
+/// too — `created_ms`, `version_id`, `recovery_nonce` — none of which DID Core governs. That bought
+/// no conformance and broke every installed `@solidus-network/sdk`, which reads them in snake_case;
+/// npm publish is founder-2FA-gated, so a coordinated release is not available. Only the DID CORE
+/// property names are renamed now, and each one is ALSO emitted under its legacy spelling, so a
+/// deployed chain serves both readers. Drop `LegacyDidNames` once no published SDK reads snake_case.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcDidDocument {
+    #[serde(rename = "@context")]
     pub context: String,
     pub id: String,
     pub controller: String,
+    #[serde(rename = "verificationMethod")]
     pub verification_method: Vec<serde_json::Value>,
     pub authentication: Vec<String>,
-    #[serde(default)]
+    #[serde(default, rename = "assertionMethod")]
     pub assertion_method: Vec<String>,
-    #[serde(default)]
+    #[serde(default, rename = "keyAgreement")]
     pub key_agreement: Vec<String>,
-    #[serde(default)]
+    #[serde(default, rename = "capabilityInvocation")]
     pub capability_invocation: Vec<String>,
-    #[serde(default)]
+    #[serde(default, rename = "capabilityDelegation")]
     pub capability_delegation: Vec<String>,
+    /// The same DID Core properties under the names the published SDK still reads.
+    #[serde(flatten, skip_deserializing)]
+    pub legacy: LegacyDidNames,
     pub service: Vec<serde_json::Value>,
     pub active: bool,
     pub created_ms: u64,
@@ -147,6 +166,49 @@ pub struct RpcDidDocument {
     pub recovery_nonce: u64,
 }
 
+/// The verification-method array, built once and used for BOTH namings.
+///
+/// `Ed25519VerificationKey2020` REQUIRES `publicKeyMultibase`, and requires the MULTICODEC value
+/// rather than the raw key. `publicKeyHex` appears in no W3C specification; it ships alongside only
+/// because the SDK on npm still reads it, and removing it would break every installed integrator at
+/// once. Drop it once the published SDK reads multibase.
+fn verification_method_json(doc: &DidDocument) -> Vec<serde_json::Value> {
+    doc.verification_method
+        .iter()
+        .map(|vm| {
+            let multibase = hex::decode(&vm.public_key_hex)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .map(|k| solidus_crypto::keys::public_key_multibase(&k));
+            serde_json::json!({
+                "id": vm.id,
+                "type": vm.method_type,
+                "controller": vm.controller,
+                // A key that is not 32 bytes cannot be encoded; emitting a wrong value would be
+                // worse than omitting it, so absence is visible as `null`.
+                "publicKeyMultibase": multibase,
+                "publicKeyHex": vm.public_key_hex,
+            })
+        })
+        .collect()
+}
+
+/// Serialise-only duplicates of the DID Core properties, under their pre-2026-08-25 names.
+///
+/// ⛔ THIS EXISTS SO A CHAIN DEPLOY DOES NOT NEED AN npm RELEASE ON THE SAME DAY. The published
+/// SDK reads `verification_method` and friends; the repo SDK reads the camelCase names first and
+/// falls back. Emitting both is the only shape that serves an installed integrator and a conformant
+/// JSON-LD processor at once.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LegacyDidNames {
+    pub context: String,
+    pub verification_method: Vec<serde_json::Value>,
+    pub assertion_method: Vec<String>,
+    pub key_agreement: Vec<String>,
+    pub capability_invocation: Vec<String>,
+    pub capability_delegation: Vec<String>,
+}
+
 impl RpcDidDocument {
     /// Convert a domain [`DidDocument`] into the RPC representation.
     pub fn from_did_document(doc: &DidDocument) -> Self {
@@ -154,23 +216,22 @@ impl RpcDidDocument {
             context: doc.context.clone(),
             id: doc.id.clone(),
             controller: doc.controller.clone(),
-            verification_method: doc
-                .verification_method
-                .iter()
-                .map(|vm| {
-                    serde_json::json!({
-                        "id": vm.id,
-                        "type": vm.method_type,
-                        "controller": vm.controller,
-                        "publicKeyHex": vm.public_key_hex,
-                    })
-                })
-                .collect(),
+            verification_method: verification_method_json(doc),
             authentication: doc.authentication.clone(),
             assertion_method: doc.assertion_method.clone(),
             key_agreement: doc.key_agreement.clone(),
             capability_invocation: doc.capability_invocation.clone(),
             capability_delegation: doc.capability_delegation.clone(),
+            // The same values under the names the published SDK reads. Built from `doc` rather
+            // than from the fields above so the two can never drift apart silently.
+            legacy: LegacyDidNames {
+                context: doc.context.clone(),
+                verification_method: verification_method_json(doc),
+                assertion_method: doc.assertion_method.clone(),
+                key_agreement: doc.key_agreement.clone(),
+                capability_invocation: doc.capability_invocation.clone(),
+                capability_delegation: doc.capability_delegation.clone(),
+            },
             service: doc
                 .service
                 .iter()
@@ -202,6 +263,19 @@ pub struct RpcCredentialRecord {
     pub id: String,
     pub issuer_did: String,
     pub subject_did: String,
+    /// Hex of the subject commitment, for a BD-6b (v2) credential. Absent for v1.
+    ///
+    /// ⚠ **This field had to be added deliberately, and that is the whitelist working.**
+    /// `RpcCredentialRecord` enumerates what leaves the node rather than deriving itself
+    /// from `CredentialRecord`, so adding `subject_commitment` to the chain record did
+    /// NOT expose it here by accident. The cost of that design is this: a v2 credential
+    /// was briefly write-only, since the holder could not read back the value they must
+    /// compare their nonce against.
+    ///
+    /// Safe to serve: the commitment is already on-chain and reveals nothing without the
+    /// issuer's nonce, which is exactly the property the scheme is built on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_commitment: Option<String>,
     pub credential_type: String,
     /// BLAKE3 hash of the off-chain credential payload (hex-encoded).
     pub hash: String,
@@ -224,6 +298,7 @@ impl RpcCredentialRecord {
             id: cred.id.clone(),
             issuer_did: cred.issuer_did.clone(),
             subject_did: cred.subject_did.clone(),
+            subject_commitment: cred.subject_commitment.map(hex::encode),
             credential_type: format!("{:?}", cred.credential_type),
             hash: hex::encode(cred.hash),
             issued_ms: cred.issued_ms,
@@ -330,6 +405,26 @@ fn event_to_json(event: &Event) -> serde_json::Value {
                 "subject": subject,
             })
         }
+        // ⚠ NOTE THE ABSENT FIELD. This deliberately does NOT emit `subject`.
+        //
+        // Receipts are served publicly by `solidus_getReceipt`, so an event is a
+        // publication surface, and it is the one the 2026-08-20 measurement found the
+        // original plan had missed: dropping `subject_did` from the payload while the
+        // event still republished it would have moved the leak rather than closed it.
+        // The commitment is emitted because it is already on-chain in the record and
+        // reveals nothing without the issuer's nonce.
+        Event::CredentialIssuedV2 {
+            credential_id,
+            issuer,
+            subject_commitment,
+        } => {
+            serde_json::json!({
+                "type": "CredentialIssuedV2",
+                "credentialId": credential_id,
+                "issuer": issuer,
+                "subjectCommitment": hex::encode(subject_commitment),
+            })
+        }
         Event::CredentialRevoked { credential_id } => {
             serde_json::json!({
                 "type": "CredentialRevoked",
@@ -407,6 +502,60 @@ fn event_to_json(event: &Event) -> serde_json::Value {
                 "reputation": reputation,
             })
         }
+        // Bridge events (bridge plan 02). Only the v2 executor emits them; the v1
+        // executor rejects every bridge payload. Rendered so this match stays total.
+        Event::BridgeDomainRegistered { domain, enabled } => {
+            serde_json::json!({
+                "type": "BridgeDomainRegistered",
+                "domain": domain,
+                "enabled": enabled,
+            })
+        }
+        Event::BridgeTrustRootSet { did, enabled } => {
+            serde_json::json!({
+                "type": "BridgeTrustRootSet",
+                "did": did,
+                "enabled": enabled,
+            })
+        }
+        Event::CredentialExported {
+            credential_id,
+            domain,
+            export_id,
+        } => {
+            serde_json::json!({
+                "type": "CredentialExported",
+                "credentialId": credential_id,
+                "domain": domain,
+                "exportId": hex::encode(export_id),
+            })
+        }
+        Event::CredentialUnexported {
+            credential_id,
+            domain,
+            export_id,
+        } => {
+            serde_json::json!({
+                "type": "CredentialUnexported",
+                "credentialId": credential_id,
+                "domain": domain,
+                "exportId": hex::encode(export_id),
+            })
+        }
+        Event::BridgeMessageQueued {
+            domain,
+            domain_seq,
+            kind,
+            message_id,
+        } => {
+            serde_json::json!({
+                "type": "BridgeMessageQueued",
+                "domain": domain,
+                "domainSeq": domain_seq,
+                "kind": kind,
+                "messageId": hex::encode(message_id),
+            })
+        }
     }
 }
 
@@ -420,6 +569,108 @@ mod tests {
     use solidus_consensus::types::{Block, BlockHeader};
     use solidus_crypto::keys::Address;
     use solidus_txns::types::{Receipt, TxStatus};
+
+    /// `did:solidus` is REGISTERED in the W3C DID Method Registry, and the registry entry points
+    /// at a specification naming `Ed25519VerificationKey2020`. The documents this RPC actually
+    /// serves have to conform to the suite they declare, or the label does not match the thing.
+    ///
+    /// Two separate breaks, asserted together because one missing serde convention causes both:
+    ///   * the JSON representation of DID Core is camelCase, and `@context` is spelled with the
+    ///     at-sign. This struct had NO renames, so every field shipped under its Rust name.
+    ///   * `Ed25519VerificationKey2020` REQUIRES `publicKeyMultibase`. `publicKeyHex` appears in
+    ///     no W3C specification.
+    #[test]
+    fn did_document_json_is_w3c_shaped() {
+        let did = "did:solidus:z6MkExample";
+        // 32 bytes, all 0x01: the value is irrelevant, the ENCODING is what is under test.
+        let key_hex = "01".repeat(32);
+        let doc = solidus_txns::did::build_did_document(did, &key_hex, vec![], 1_700_000_000_000);
+        let json = serde_json::to_value(RpcDidDocument::from_did_document(&doc)).unwrap();
+
+        // DID Core property names, not Rust field names.
+        assert!(
+            json.get("@context").is_some(),
+            "DID Core spells it `@context`, not `context`"
+        );
+        for camel in ["verificationMethod", "assertionMethod", "keyAgreement"] {
+            assert!(
+                json.get(camel).is_some(),
+                "missing camelCase property `{camel}`"
+            );
+        }
+        // ⛔ THE LEGACY NAMES SHIP TOO, AND THIS ASSERTION REVERSES AN EARLIER ONE ON PURPOSE.
+        // The first cut of this fix asserted the snake_case names were ABSENT. That is the correct
+        // END state and the wrong MIGRATION state: a published `@solidus-network/sdk` reads them,
+        // npm publish is founder-2FA-gated, and a chain deploy cannot wait for a coordinated
+        // release. Emitting both is what lets the chain ship without breaking installed readers.
+        // ⇒ Deleting these four assertions is the other half of finishing the migration, alongside
+        //   dropping `publicKeyHex` above.
+        for legacy in [
+            "context",
+            "verification_method",
+            "assertion_method",
+            "key_agreement",
+        ] {
+            assert!(
+                json.get(legacy).is_some(),
+                "legacy name `{legacy}` must still ship"
+            );
+        }
+        // A duplicate that silently diverges is worse than no duplicate, so pin that they agree.
+        assert_eq!(json["verification_method"], json["verificationMethod"]);
+        assert_eq!(json["context"], json["@context"]);
+
+        // ⚠ OUR OWN EXTENSION FIELDS ARE NOT DID CORE AND MUST NOT BE RENAMED. A blanket
+        // `rename_all = "camelCase"` renamed them for no conformance gain and broke every
+        // installed reader, which is the defect this shape exists to avoid.
+        for ours in ["created_ms", "updated_ms", "version_id"] {
+            assert!(
+                json.get(ours).is_some(),
+                "extension field `{ours}` must stay snake_case"
+            );
+        }
+
+        let vm = &json["verificationMethod"][0];
+        assert_eq!(vm["type"], "Ed25519VerificationKey2020");
+
+        // The suite it declares requires this property, and requires the MULTICODEC value:
+        // 0xed 0x01 followed by the 32 key bytes, base58btc, `z`-prefixed. Decoding ours must give
+        // 34 bytes with that header — a raw 32-byte encoding is what a strict verifier rejects.
+        let mb = vm["publicKeyMultibase"]
+            .as_str()
+            .expect("publicKeyMultibase is required");
+        assert!(
+            mb.starts_with('z'),
+            "multibase base58btc prefix is `z`, got {mb}"
+        );
+        let decoded = bs58::decode(&mb[1..])
+            .into_vec()
+            .expect("base58btc must decode");
+        assert_eq!(
+            decoded.len(),
+            34,
+            "expected 2 header bytes + 32 key bytes, got {}",
+            decoded.len()
+        );
+        assert_eq!(
+            &decoded[..2],
+            &[0xed, 0x01],
+            "missing the ed25519-pub multicodec header"
+        );
+        assert_eq!(
+            &decoded[2..],
+            &[0x01u8; 32],
+            "key bytes did not survive the encoding"
+        );
+
+        // ⚠ CONTROL, and it is why this is a migration rather than a rename: the SDK on npm reads
+        // `vm.publicKeyHex`. Removing it here breaks every installed integrator, so both ship until
+        // the consumer side has moved. This assertion is what must be DELETED to finish the job.
+        assert!(
+            vm.get("publicKeyHex").is_some(),
+            "publicKeyHex still ships during migration"
+        );
+    }
 
     #[test]
     fn rpc_block_from_block() {
@@ -491,6 +742,55 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         let back: NodeInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(info, back);
+    }
+
+    /// The bridge events (bridge plan 02) are emitted only by the v2 executor, but
+    /// `event_to_json` is total over `Event`, so each gets an explicit shape here,
+    /// in the same style as `CredentialIssuedV2`: camelCase keys, byte arrays in hex.
+    #[test]
+    fn bridge_events_render_with_camel_case_keys_and_hex_bytes() {
+        let exported = event_to_json(&Event::CredentialExported {
+            credential_id: "urn:c".into(),
+            domain: 11_155_111,
+            export_id: [4; 32],
+        });
+        assert_eq!(exported["type"], "CredentialExported");
+        assert_eq!(exported["credentialId"], "urn:c");
+        assert_eq!(exported["domain"], 11_155_111);
+        assert_eq!(exported["exportId"], hex::encode([4u8; 32]));
+
+        let queued = event_to_json(&Event::BridgeMessageQueued {
+            domain: 7,
+            domain_seq: 3,
+            kind: 2,
+            message_id: [9; 32],
+        });
+        assert_eq!(queued["type"], "BridgeMessageQueued");
+        assert_eq!(queued["domainSeq"], 3);
+        assert_eq!(queued["kind"], 2);
+        assert_eq!(queued["messageId"], hex::encode([9u8; 32]));
+
+        let unexported = event_to_json(&Event::CredentialUnexported {
+            credential_id: "urn:c".into(),
+            domain: 7,
+            export_id: [5; 32],
+        });
+        assert_eq!(unexported["type"], "CredentialUnexported");
+        assert_eq!(unexported["exportId"], hex::encode([5u8; 32]));
+
+        let registered = event_to_json(&Event::BridgeDomainRegistered {
+            domain: 7,
+            enabled: false,
+        });
+        assert_eq!(registered["type"], "BridgeDomainRegistered");
+        assert_eq!(registered["enabled"], false);
+
+        let root = event_to_json(&Event::BridgeTrustRootSet {
+            did: "did:solidus:testnet:x".into(),
+            enabled: true,
+        });
+        assert_eq!(root["type"], "BridgeTrustRootSet");
+        assert_eq!(root["did"], "did:solidus:testnet:x");
     }
 }
 

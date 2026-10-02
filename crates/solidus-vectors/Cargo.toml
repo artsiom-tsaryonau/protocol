@@ -1,0 +1,21 @@
+[package]
+name = "solidus-vectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The conformance-vector runner. Not a library anyone depends on — it exists so
+# `cargo test -p solidus-vectors` answers one question: does this workspace agree
+# with the 12 vectors we publish and ask third parties to run against us?
+#
+# Deliberately has no src/. Everything lives in tests/conformance.rs.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+solidus-crypto = { path = "../solidus-crypto", features = ["bbs"] }
+solidus-client = { path = "../solidus-client" }
+serde_json = { workspace = true }

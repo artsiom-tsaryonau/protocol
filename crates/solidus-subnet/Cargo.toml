@@ -14,4 +14,7 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-solidus-crypto = { workspace = true }
+solidus-crypto = { workspace = true, features = ["consensus"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+blst = { workspace = true }

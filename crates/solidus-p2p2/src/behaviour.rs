@@ -12,6 +12,7 @@
 //! stream to `Node::step` is the mechanical remainder.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use libp2p::gossipsub::{self, MessageAuthenticity, ValidationMode};
 use libp2p::request_response::{self, ProtocolSupport};
@@ -83,6 +84,24 @@ pub fn build_swarm_with_keypair(
             Ok(SolidusBehaviour { gossipsub, direct })
         })
         .map_err(|e| P2pError::Build(e.to_string()))?
+        // ⛔ WITHOUT THIS, libp2p 0.54 CLOSES AN IDLE CONNECTION IMMEDIATELY.
+        // `PoolConfig`'s default is `Duration::ZERO` (measured in
+        // libp2p-swarm-0.45.1/src/connection/pool.rs), so a connection survives
+        // only while some behaviour actively reports keep-alive. Gossipsub does
+        // that for explicit/mesh peers, which is the ONLY reason the committee
+        // stays connected today — a transport property held up by a side effect
+        // of the gossip layer.
+        //
+        // The request/response paths cannot rely on that. A block-body or
+        // block-range fetch is a round trip on a connection that carries no
+        // gossip traffic of its own, and it is issued exactly when a node is
+        // behind and least likely to be in anyone's mesh. Measured: a fetch
+        // over a freshly dialled connection lost the connection to
+        // `KeepAliveTimeout` before the request was dispatched.
+        //
+        // 30s is chosen to outlast a fetch round trip plus retries, not to keep
+        // idle strangers around; committee links are held open by gossip anyway.
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
 
     // Subscribe to every broadcast topic.
@@ -117,11 +136,26 @@ impl PeerDirectory {
     pub fn peer(&self, index: u32) -> Option<&PeerId> {
         self.by_index.get(&index)
     }
+
+    /// Known committee indices, ascending.
+    ///
+    /// Sorted deliberately: `HashMap` iteration order varies per process, and a
+    /// backfill that picks a different peer on every attempt for no reason is
+    /// harder to reason about than one that rotates predictably.
+    pub fn indices(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.by_index.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
 }
 
 /// Publish `bytes` to a gossip topic on `swarm`. Ignores the
-/// "insufficient peers" transient (a lone node has no one to publish to
-/// yet) — those messages simply have no audience.
+/// "no peers subscribed" transient (a lone node has no one to publish to
+/// yet) - those messages simply have no audience.
+///
+/// The variant was named `InsufficientPeers` until gossipsub 0.50 renamed it to
+/// `NoPeersSubscribedToTopic`. Same condition, clearer name: it means nobody is subscribed to THIS
+/// topic, not that the swarm has too few peers overall.
 pub fn publish(
     swarm: &mut Swarm<SolidusBehaviour>,
     chain_id: u64,
@@ -131,7 +165,7 @@ pub fn publish(
     let t = gossipsub::IdentTopic::new(topic.ident(chain_id));
     match swarm.behaviour_mut().gossipsub.publish(t, bytes) {
         Ok(_) => Ok(()),
-        Err(gossipsub::PublishError::InsufficientPeers) => Ok(()),
+        Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => Ok(()),
         Err(e) => Err(P2pError::Gossipsub(e.to_string())),
     }
 }
@@ -148,6 +182,16 @@ pub fn send_direct(
     }
     // No mapping yet ⇒ drop (the peer hasn't connected); consensus
     // liveness tolerates a missed vote and re-drives via the pacemaker.
+}
+
+/// Send `bytes` to a peer we are already talking to, addressed by the
+/// transport's own `PeerId` rather than by anything the message claimed.
+///
+/// ⛔ USE THIS TO ANSWER A REQUEST. Replying to an index carried INSIDE an
+/// untrusted frame is a reflection amplifier; the transport-level sender is not
+/// forgeable by the sender.
+pub fn send_direct_to_peer(swarm: &mut Swarm<SolidusBehaviour>, peer: PeerId, bytes: Vec<u8>) {
+    swarm.behaviour_mut().direct.send_request(&peer, bytes);
 }
 
 /// Dial a peer's listen address.

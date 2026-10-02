@@ -68,6 +68,29 @@ impl fmt::Debug for Address {
     }
 }
 
+/// Multicodec header for an Ed25519 public key (`ed25519-pub`, varint `0xed01`).
+///
+/// ⚠ Required by `Ed25519VerificationKey2020`, and omitted by this project until 2026-08-07.
+/// Encoder and decoder both assumed it was absent, so we round-tripped with ourselves and rejected
+/// a correctly-encoded key from anyone else. This constant exists so a future reader can see the
+/// header is deliberate rather than incidental.
+const ED25519_PUB_MULTICODEC: [u8; 2] = [0xed, 0x01];
+
+/// `publicKeyMultibase` for a raw 32-byte Ed25519 public key: base58btc of the `ed25519-pub`
+/// multicodec header followed by the key. Produces a `z6Mk…` string.
+///
+/// ⚠ IT LIVES HERE BECAUSE THREE CRATES NEED IT. `solidus-client` had the only copy, hand-rolling
+/// its own base58 because it did not want the dependency; `solidus-rpc` needs the same value to
+/// serve a conformant DID document and cannot reach `solidus-client` without inverting the
+/// layering. `solidus-crypto` is the common ancestor of all three and already depends on `bs58`.
+/// A spec-critical encoder duplicated per crate is a drift with nothing to say which copy is right.
+pub fn public_key_multibase(public_key: &[u8; 32]) -> String {
+    let mut buf = Vec::with_capacity(34);
+    buf.extend_from_slice(&ED25519_PUB_MULTICODEC);
+    buf.extend_from_slice(public_key);
+    format!("z{}", bs58::encode(&buf).into_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +112,27 @@ mod tests {
         let addr1 = Address::from_public_key(&key1.verifying_key());
         let addr2 = Address::from_public_key(&key2.verifying_key());
         assert_ne!(addr1, addr2);
+    }
+
+    /// The vector in the backlog item, computed from the live chain key. `z6Mk…` is what a
+    /// conformant resolver produces; a raw 32-byte encoding yields a different string entirely and
+    /// fails to load as key material.
+    #[test]
+    fn public_key_multibase_carries_the_multicodec_header() {
+        let key = [0x01u8; 32];
+        let mb = public_key_multibase(&key);
+        assert!(mb.starts_with('z'), "base58btc multibase prefix is `z`");
+        let decoded = bs58::decode(&mb[1..]).into_vec().unwrap();
+        assert_eq!(decoded.len(), 34, "2 header bytes + 32 key bytes");
+        assert_eq!(&decoded[..2], &[0xed, 0x01]);
+        assert_eq!(&decoded[2..], &key);
+        // ⚠ PINNED VECTOR, THE SAME LITERAL AS THE SDK's did-document-shape.test.ts. A test that
+        // only decodes what it encoded agrees with itself; two implementations doing that can still
+        // disagree with each other, which is precisely what happened before the header was added.
+        assert_eq!(mb, "z6MkeXBLjYiSvqnhFb6D7sHm8yKm4jV45wwBFRaatf1cfZ76");
+        // CONTROL: the raw form the project used to emit is a DIFFERENT string, which is the whole
+        // defect. If these ever match, the header stopped being applied.
+        assert_ne!(mb, format!("z{}", bs58::encode(&key).into_string()));
     }
 
     #[test]

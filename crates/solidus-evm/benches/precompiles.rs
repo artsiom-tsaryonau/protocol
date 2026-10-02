@@ -60,6 +60,9 @@ fn bench_precompiles(c: &mut Criterion) {
         id: "urn:solidus:credential:bench".to_string(),
         issuer_did: "did:solidus:v2:issuer".to_string(),
         subject_did: "did:solidus:v2:subject".to_string(),
+        // v1 shape: the subject is PUBLISHED above, so there is no commitment to it.
+        // `subject_commitment` is the BD-6b (v2) field and is `None` for a v1 record.
+        subject_commitment: None,
         credential_type: CredentialType::KycL2,
         hash: [9u8; 32],
         issued_ms: 1_000,

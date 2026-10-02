@@ -5,7 +5,7 @@
 //! this implementation.
 //!
 //! Two configurations matter:
-//! - **v2 oracle:** `ExecOptions::v2_defaults()` — binary wire,
+//! - **v2 oracle:** `ExecOptions::v2_defaults(chain_id)` — binary wire,
 //!   lane-partitioned canonical order (D-ORDER), burn fees.
 //! - **Parity anchor:** `ExecOptions::legacy_anchor(..)` — legacy JSON
 //!   wire, raw block order, 70/20/10 fee split; byte-identical to the live
@@ -30,6 +30,8 @@ pub struct BlockOutcome {
     pub receipts: Vec<Receipt>,
     /// The block's finalized write set (fee settlement included).
     pub delta: DeltaSet,
+    /// Events not tied to one transaction (bridge heartbeats). Empty before V2.
+    pub block_events: Vec<solidus_txns::types::Event>,
 }
 
 impl BlockOutcome {
@@ -55,6 +57,9 @@ pub fn execute_block_reference<R: StateReader + ?Sized>(
     ctx: &BlockCtx<'_>,
     opts: &ExecOptions,
 ) -> Result<BlockOutcome, ExecError> {
+    // ⛔ The wire is a function of HEIGHT, not of config: at a V2 height a
+    // BinaryV2 base becomes BinaryV3 bound to this chain id.
+    let wire = crate::wire::wire_for_height(opts.wire, opts.chain_id, ctx.height);
     // Lane partition runs over sig-valid txs only (§5.3: the signature
     // pre-pass precedes the lane split; the oracle verifies serially —
     // simplest correct). RawBlock ignores the mask: the live chain checks
@@ -63,7 +68,7 @@ pub fn execute_block_reference<R: StateReader + ?Sized>(
         crate::types::ExecOrder::RawBlock => Vec::new(),
         crate::types::ExecOrder::LanePartitioned => txs
             .iter()
-            .map(|tx| crate::wire::verify_signature(tx, opts.wire))
+            .map(|tx| crate::wire::verify_signature(tx, wire))
             .collect(),
     };
     let order = execution_order(txs, &valid, opts.order, opts.identity_cap)?;
@@ -74,8 +79,14 @@ pub fn execute_block_reference<R: StateReader + ?Sized>(
 
     for &i in &order {
         let mut view = SerialView::new(&mut delta, baseline, &mut fees);
-        let receipt = handlers::run_tx(&mut view, &txs[i], ctx, opts.wire)?;
+        let receipt = handlers::run_tx(&mut view, &txs[i], ctx, wire)?;
         receipts[i] = Some(receipt);
+    }
+
+    let mut block_events = Vec::new();
+    if ctx.protocol_version() >= crate::protocol::ProtocolVersion::V2 {
+        let mut view = SerialView::new(&mut delta, baseline, &mut fees);
+        block_events = crate::bridge::on_block_end(&mut view, ctx)?;
     }
 
     fee::settle(&opts.fee_policy, &fees, &mut delta, baseline)?;
@@ -87,7 +98,7 @@ pub fn execute_block_reference<R: StateReader + ?Sized>(
             debug_assert!(r.is_some(), "execution order must cover every tx index");
             r.unwrap_or_else(|| {
                 handlers::failed_receipt(
-                    crate::wire::tx_hash(&txs[i], opts.wire),
+                    crate::wire::tx_hash(&txs[i], wire),
                     ctx.height,
                     0,
                     "internal: tx not covered by execution order".to_string(),
@@ -96,7 +107,11 @@ pub fn execute_block_reference<R: StateReader + ?Sized>(
         })
         .collect();
 
-    Ok(BlockOutcome { receipts, delta })
+    Ok(BlockOutcome {
+        receipts,
+        delta,
+        block_events,
+    })
 }
 
 #[cfg(test)]
@@ -116,6 +131,7 @@ mod tests {
             height: 1,
             timestamp_ms: 1_700_000_000_000,
             network: "testnet",
+            parent_state_root: [0u8; 32],
         }
     }
 
@@ -155,7 +171,7 @@ mod tests {
         fund(&mut state, sender_addr, 1_000_000);
 
         let tx = signed_transfer(&sender_key, recipient, 500, 0, WireMode::BinaryV2);
-        let opts = ExecOptions::v2_defaults();
+        let opts = ExecOptions::v2_defaults(50_002);
         let outcome = execute_block_reference(&state, &[tx], &ctx(), &opts).expect("execute");
 
         assert_eq!(outcome.receipts.len(), 1);
@@ -217,7 +233,7 @@ mod tests {
         let msg = wire::signing_bytes(&t_alice, WireMode::BinaryV2);
         t_alice.signature = sign(&alice, &msg);
 
-        let opts = ExecOptions::v2_defaults();
+        let opts = ExecOptions::v2_defaults(50_002);
         let outcome =
             execute_block_reference(&state, &[t_bob, t_alice], &ctx(), &opts).expect("execute");
 
@@ -232,5 +248,65 @@ mod tests {
             outcome.receipts[1]
         );
         assert_eq!(outcome.receipts[0].status, TxStatus::Success);
+    }
+
+    /// A block at a V2 height accepts only V3 signatures for this chain; before
+    /// it, only V2. `TxStatus` has only `Success` and `Failed(_)`, so "rejected"
+    /// is asserted as "not Success" on an otherwise valid, funded transfer.
+    #[cfg(feature = "test-activation-schedule")]
+    #[test]
+    fn signature_wire_follows_the_block_height_across_v2_activation() {
+        use crate::protocol::V2_ACTIVATION_HEIGHT;
+        const CHAIN: u64 = 50_002;
+
+        let run = |height: u64, mode: WireMode| -> TxStatus {
+            let mut state = InMemoryState::new();
+            let key = generate_signing_key();
+            fund(
+                &mut state,
+                Address::from_public_key(&key.verifying_key()),
+                1_000_000,
+            );
+            let tx = signed_transfer(&key, Address::from_bytes([0xCD; 20]), 500, 0, mode);
+            let ctx = BlockCtx {
+                height,
+                timestamp_ms: 1_700_000_000_000,
+                network: "testnet",
+                parent_state_root: [0u8; 32],
+            };
+            execute_block_reference(&state, &[tx], &ctx, &ExecOptions::v2_defaults(CHAIN))
+                .expect("execute")
+                .receipts[0]
+                .status
+                .clone()
+        };
+
+        let before = V2_ACTIVATION_HEIGHT - 1;
+        assert_eq!(run(before, WireMode::BinaryV2), TxStatus::Success);
+        assert_ne!(
+            run(before, WireMode::BinaryV3 { chain_id: CHAIN }),
+            TxStatus::Success
+        );
+
+        let at = V2_ACTIVATION_HEIGHT;
+        assert_eq!(
+            run(at, WireMode::BinaryV3 { chain_id: CHAIN }),
+            TxStatus::Success
+        );
+        assert_ne!(
+            run(at, WireMode::BinaryV2),
+            TxStatus::Success,
+            "a v2 signature must stop working at activation"
+        );
+        assert_ne!(
+            run(
+                at,
+                WireMode::BinaryV3 {
+                    chain_id: CHAIN + 1
+                }
+            ),
+            TxStatus::Success,
+            "replay from another chain"
+        );
     }
 }

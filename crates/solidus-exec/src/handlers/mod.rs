@@ -169,7 +169,11 @@ pub(crate) fn is_fee_exempt(payload: &TxPayload) -> bool {
             | TxPayload::DidRecover { .. }
             | TxPayload::CredentialIssue { .. }
             | TxPayload::CredentialIssueBbs { .. }
+            | TxPayload::CredentialIssueV2 { .. }
             | TxPayload::CredentialRevoke { .. }
+            | TxPayload::BridgeGovernance { .. }
+            | TxPayload::ExportCredential { .. }
+            | TxPayload::UnexportCredential { .. }
     )
 }
 
@@ -308,6 +312,21 @@ pub fn run_tx<V: TxView>(
             *credential_type,
             *hash,
         ),
+        TxPayload::CredentialIssueV2 {
+            subject_commitment,
+            credential_type,
+            hash,
+        } => credential::handle_credential_issue_v2(
+            view,
+            sender,
+            sender_addr,
+            ctx,
+            tx_hash,
+            fee,
+            *subject_commitment,
+            *credential_type,
+            *hash,
+        ),
         TxPayload::CredentialIssueBbs {
             subject_did,
             credential_type,
@@ -362,5 +381,65 @@ pub fn run_tx<V: TxView>(
                 "compute-module transactions are not supported on this network".to_string(),
             ))
         }
+        // Bridge payloads (bridge plan 02). Before V2 they fail with a normal
+        // receipt (nonce bumped, fee-exempt), like any in-handler failure.
+        TxPayload::BridgeGovernance { .. }
+        | TxPayload::ExportCredential { .. }
+        | TxPayload::UnexportCredential { .. }
+            if ctx.protocol_version() < crate::protocol::ProtocolVersion::V2 =>
+        {
+            save_account(view, &sender)?;
+            Ok(failed_receipt(
+                tx_hash,
+                ctx.height,
+                fee,
+                crate::bridge::NOT_ACTIVE.to_string(),
+            ))
+        }
+        TxPayload::BridgeGovernance {
+            action,
+            gov_nonce,
+            approvals,
+        } => crate::bridge::governance::handle_bridge_governance(
+            view, sender, ctx, tx_hash, fee, action, *gov_nonce, approvals,
+        ),
+        TxPayload::ExportCredential {
+            credential_id,
+            domain,
+            holder,
+            valid_until,
+            consent_sig,
+            consent_expiry,
+        } => crate::bridge::export::handle_export(
+            view,
+            sender,
+            sender_addr,
+            ctx,
+            tx_hash,
+            fee,
+            crate::bridge::export::ExportArgs {
+                credential_id,
+                domain: *domain,
+                holder: *holder,
+                valid_until: *valid_until,
+                consent_sig,
+                consent_expiry: *consent_expiry,
+            },
+        ),
+        TxPayload::UnexportCredential {
+            credential_id,
+            domain,
+            holder,
+        } => crate::bridge::export::handle_unexport(
+            view,
+            sender,
+            sender_addr,
+            ctx,
+            tx_hash,
+            fee,
+            credential_id,
+            *domain,
+            *holder,
+        ),
     }
 }

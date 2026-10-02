@@ -20,6 +20,6 @@ pub mod backend;
 pub mod methods;
 pub mod server;
 
-pub use backend::{RpcBackend, Store2Backend};
+pub use backend::{RpcBackend, RpcBlock, Store2Backend};
 pub use methods::RpcError;
 pub use server::serve;

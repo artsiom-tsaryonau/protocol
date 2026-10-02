@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
 use solidus_crypto::hash::{blake3_hash, empty_hashes};
@@ -79,6 +79,24 @@ pub fn zero_bits_below(data: &mut [u8; 32], pos: usize) {
     }
 }
 
+/// Reverse the bit order of a 32-byte hash: bit `i` becomes bit `255 - i`.
+///
+/// The walk consumes bits 0..L-1 (most significant first), so two leaves share
+/// an internal node at level L exactly when they agree on bits L..255 — a
+/// SUFFIX. Reversing turns that suffix into a PREFIX, which makes "every leaf
+/// beneath this node" a contiguous range in a `BTreeMap`. That range query is
+/// what lets the tree store only branching nodes: see `leaves_under`.
+fn rev_bits(h: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..256usize {
+        if get_bit(h, i) == 1 {
+            let j = 255 - i;
+            out[j / 8] |= 1 << (7 - (j % 8));
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // SparseMerkleTree (in-memory, incremental)
 // ---------------------------------------------------------------------------
@@ -97,10 +115,28 @@ pub fn zero_bits_below(data: &mut [u8; 32], pos: usize) {
 /// updates the root as if the map always held the new value.
 #[derive(Clone)]
 pub struct SparseMerkleTree {
-    /// (level, canonical path) → node hash.
+    /// (level, canonical path) → node hash, for BRANCHING nodes only.
+    ///
+    /// ⚠ **STORING EVERY LEVEL IS WHAT OOM-KILLED THE TESTNET.** The previous
+    /// implementation inserted a node at all 256 levels on every `insert`. Near
+    /// the leaves each key owns a distinct path, so the map held roughly
+    /// `238 * N` entries — about 25 KB of heap PER STATE KEY. Measured
+    /// 2026-09-05 on solidus-rpc: 315-530 MB of state on disk became
+    /// `VmData` 8.5 GB, and all four validators were killed at boot.
+    ///
+    /// A node whose subtree holds exactly ONE leaf needs no entry: every
+    /// sibling below it is empty by construction, so its hash folds up from
+    /// that leaf through the empty ladder (`derive_single_leaf`). Only nodes
+    /// with two or more leaves beneath them are stored, which is O(N), not
+    /// O(256 N). Roots are unchanged — this is a storage change, not a
+    /// hashing change, and `root_matches_naive_reference` pins that.
     nodes: HashMap<(u16, [u8; 32]), [u8; 32]>,
-    /// key_hash → raw leaf value (for reads and proofs later).
-    leaves: HashMap<[u8; 32], Vec<u8>>,
+    /// rev_bits(key_hash) → (key_hash, raw value).
+    ///
+    /// Keyed by the REVERSED hash so that "the leaves beneath (level, path)"
+    /// is a contiguous range. The true `key_hash` is carried in the value
+    /// because deriving a node hash needs the unreversed bits.
+    leaves: BTreeMap<[u8; 32], ([u8; 32], Vec<u8>)>,
     root: [u8; 32],
 }
 
@@ -110,12 +146,15 @@ impl Default for SparseMerkleTree {
     }
 }
 
+/// Up to two leaves found under one subtree, each as `(key hash, index)`.
+type TwoLeaves = [Option<([u8; 32], usize)>; 2];
+
 impl SparseMerkleTree {
     /// Create a new empty tree (root = empty ladder top).
     pub fn new() -> Self {
         Self {
             nodes: HashMap::new(),
-            leaves: HashMap::new(),
+            leaves: BTreeMap::new(),
             root: EMPTY_HASHES[255],
         }
     }
@@ -130,22 +169,110 @@ impl SparseMerkleTree {
         self.leaves.len()
     }
 
+    /// Leaf hash for a key hash and its raw value: `BLAKE3(key_hash || BLAKE3(value))`.
+    fn leaf_hash(key_hash: &[u8; 32], value: &[u8]) -> [u8; 32] {
+        let mut leaf_data = [0u8; 64];
+        leaf_data[..32].copy_from_slice(key_hash);
+        leaf_data[32..].copy_from_slice(&blake3_hash(value));
+        blake3_hash(&leaf_data)
+    }
+
+    /// Inclusive key range in `leaves` covering every leaf beneath `(level, path)`.
+    ///
+    /// Leaves under this node agree on bits `level..255`, which after `rev_bits`
+    /// is a shared prefix of length `256 - level`. The range therefore runs from
+    /// that prefix with all remaining bits 0 to the same prefix with all 1.
+    fn subtree_range(level: u16, path: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+        let prefix_len = 256usize - level as usize;
+        let rp = rev_bits(path);
+        let mut lo = [0u8; 32];
+        let mut hi = [0xffu8; 32];
+        for i in 0..prefix_len {
+            let bit = (rp[i / 8] >> (7 - (i % 8))) & 1;
+            let mask = 1u8 << (7 - (i % 8));
+            if bit == 1 {
+                lo[i / 8] |= mask;
+            } else {
+                hi[i / 8] &= !mask;
+            }
+        }
+        (lo, hi)
+    }
+
+    /// The leaves beneath `(level, path)`, capped at two.
+    ///
+    /// Two is all the caller needs: zero means an empty subtree, one means the
+    /// hash is derivable, and two or more means the node must be stored. Taking
+    /// only two keeps this O(log N) rather than O(subtree size).
+    fn leaves_under(&self, level: u16, path: &[u8; 32]) -> (TwoLeaves, usize) {
+        let (lo, hi) = Self::subtree_range(level, path);
+        let mut found: TwoLeaves = [None, None];
+        let mut n = 0usize;
+        for (_rk, (kh, _v)) in self.leaves.range(lo..=hi) {
+            if n < 2 {
+                found[n] = Some((*kh, 0));
+            }
+            n += 1;
+            if n >= 2 {
+                break;
+            }
+        }
+        (found, n)
+    }
+
+    /// Fold a lone leaf up to `level`, every sibling empty.
+    ///
+    /// Sound because a subtree holding exactly one leaf has no other leaf below
+    /// `level`, so each sibling on the way up really is the empty-ladder hash.
+    fn derive_single_leaf(&self, key_hash: &[u8; 32], level: u16) -> [u8; 32] {
+        let value = self
+            .leaves
+            .get(&rev_bits(key_hash))
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&[]);
+        let mut h = Self::leaf_hash(key_hash, value);
+        for j in 0..level as usize {
+            let sibling = EMPTY_HASHES[j];
+            let mut pair = [0u8; 64];
+            if get_bit(key_hash, j) == 0 {
+                pair[..32].copy_from_slice(&h);
+                pair[32..].copy_from_slice(&sibling);
+            } else {
+                pair[..32].copy_from_slice(&sibling);
+                pair[32..].copy_from_slice(&h);
+            }
+            h = blake3_hash(&pair);
+        }
+        h
+    }
+
+    /// Hash of the node at `(level, path)`: stored if branching, derived if a
+    /// single leaf sits beneath it, empty-ladder if the subtree is empty.
+    fn node_hash(&self, level: u16, path: &[u8; 32]) -> [u8; 32] {
+        if let Some(h) = self.nodes.get(&(level, *path)) {
+            return *h;
+        }
+        let (found, n) = self.leaves_under(level, path);
+        match n {
+            0 => EMPTY_HASHES[level as usize],
+            _ => match found[0] {
+                Some((kh, _)) => self.derive_single_leaf(&kh, level),
+                None => EMPTY_HASHES[level as usize],
+            },
+        }
+    }
+
     /// Insert (or update) a key-value pair, returning the new root.
-    /// O(256) node updates per call — this is the incremental path the
-    /// live chain's block loop never used.
+    ///
+    /// Still O(256) hashing per call, which the root requires. What changed is
+    /// storage: a node is written only when two or more leaves sit beneath it.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> [u8; 32] {
         let key_hash = blake3_hash(key);
-        let value_hash = blake3_hash(value);
+        self.leaves
+            .insert(rev_bits(&key_hash), (key_hash, value.to_vec()));
 
-        self.leaves.insert(key_hash, value.to_vec());
+        let mut current_hash = Self::leaf_hash(&key_hash, value);
 
-        // Leaf hash: BLAKE3(key_hash || value_hash)
-        let mut leaf_data = [0u8; 64];
-        leaf_data[..32].copy_from_slice(&key_hash);
-        leaf_data[32..].copy_from_slice(&value_hash);
-        let mut current_hash = blake3_hash(&leaf_data);
-
-        // Walk from level 0 to 255, updating canonical internal nodes.
         for level in 0..256u16 {
             let bit = get_bit(&key_hash, level as usize);
 
@@ -155,13 +282,16 @@ impl SparseMerkleTree {
             let mut sibling_path = current_path;
             flip_bit(&mut sibling_path, level as usize);
 
-            let sibling_hash = self
-                .nodes
-                .get(&(level, sibling_path))
-                .copied()
-                .unwrap_or(EMPTY_HASHES[level as usize]);
+            let sibling_hash = self.node_hash(level, &sibling_path);
 
-            self.nodes.insert((level, current_path), current_hash);
+            // Store only branching nodes. A single-leaf subtree is recomputed by
+            // `derive_single_leaf`, and storing it is what made the map O(256 N).
+            let (_, n) = self.leaves_under(level, &current_path);
+            if n >= 2 {
+                self.nodes.insert((level, current_path), current_hash);
+            } else {
+                self.nodes.remove(&(level, current_path));
+            }
 
             let (left, right) = if bit == 0 {
                 (current_hash, sibling_hash)
@@ -179,20 +309,34 @@ impl SparseMerkleTree {
         self.root
     }
 
+    /// Nodes held in memory. Exposed so the O(N) bound is observable: this must
+    /// scale with leaf count, never with `256 * leaf_count`.
+    pub fn stored_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Retrieve the raw value last inserted for `key`, if any.
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
         let key_hash = blake3_hash(key);
-        self.leaves.get(&key_hash).map(|v| v.as_slice())
+        self.leaves
+            .get(&rev_bits(&key_hash))
+            .map(|(_, v)| v.as_slice())
     }
 
     /// Internal-node lookup at (level, canonical path) — proof generation.
     pub(crate) fn node(&self, level: u16, path: &[u8; 32]) -> Option<[u8; 32]> {
-        self.nodes.get(&(level, *path)).copied()
+        // Derives when the node is not stored, so proofs are unaffected by the
+        // branching-only storage rule.
+        let (_, n) = self.leaves_under(level, path);
+        if n == 0 && !self.nodes.contains_key(&(level, *path)) {
+            return None;
+        }
+        Some(self.node_hash(level, path))
     }
 
     /// Leaf lookup by key hash — proof generation.
     pub(crate) fn leaf_value(&self, key_hash: &[u8; 32]) -> Option<&Vec<u8>> {
-        self.leaves.get(key_hash)
+        self.leaves.get(&rev_bits(key_hash)).map(|(_, v)| v)
     }
 }
 

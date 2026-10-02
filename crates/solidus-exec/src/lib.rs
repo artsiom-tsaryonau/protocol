@@ -35,6 +35,25 @@
 //!    sharing one RocksDB instance don't double-apply blocks. v2 executes a
 //!    committed block exactly once per store; multi-validator-one-store is
 //!    not a supported v2 topology.
+//!
+//!    ⛔ THAT REASONING IS ABOUT THE WRONG CASE, MEASURED 2026-09-24. It
+//!    argues one BLOCK executed twice against one store. What actually
+//!    happens is one TRANSACTION in TWO DIFFERENT BLOCKS, each executed
+//!    exactly once: every validator's worker seals its own batch and the DAG
+//!    mempool dedupes BATCHES by digest, not TRANSACTIONS across batches,
+//!    which is how Narwhal-style mempools are meant to behave. Live proof:
+//!    tx `df8676b0…` in blocks 3222202 AND 3222203, proposers 0 then 1.
+//!
+//!    The first copy executes and moves the money; the second fails the nonce
+//!    check against the account its own first copy bumped. Execution stays
+//!    correct — the nonce check is what makes the duplicate harmless — so the
+//!    short-circuit is still not needed HERE, and this omission stands.
+//!    What broke was the READ path: `tx_index` (tx_hash → height) was
+//!    overwritten by the second inclusion, so `solidus_getReceipt` resolved
+//!    to the failed execution and reported a successful transfer as failed.
+//!    Fixed in `solidus-store2::Store2::persist_block` — first write wins —
+//!    and pinned by `a_transaction_included_twice_keeps_the_index_on_its_real_execution`.
+//!    Do not "restore" the short-circuit here expecting it to fix receipts.
 //! 2. **Receipt persistence inside execution** — the reference executor
 //!    *returns* receipts; storage is the node layer's concern (one
 //!    WriteBatch per block, Stage 4).
@@ -46,6 +65,7 @@
 //!    preserved verbatim from `solidus-txns`.
 
 pub mod account;
+pub mod bridge;
 pub mod delta;
 pub mod error;
 pub mod fee;
@@ -53,6 +73,7 @@ pub mod handlers;
 pub mod lane;
 pub mod mvmemory;
 pub mod payment;
+pub mod protocol;
 pub mod reference;
 pub mod twolane;
 pub mod types;

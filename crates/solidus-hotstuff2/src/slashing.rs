@@ -94,16 +94,18 @@ impl Equivocation {
                 let key = committee
                     .key(a.voter)
                     .map_err(|_| EvidenceError::UnknownValidator(a.voter))?;
-                if !a
-                    .sig
-                    .verify(key, &vote_message(chain_id, a.view, &a.block_hash))
-                {
+                if !a.sig.verify_with_dst(
+                    key,
+                    &vote_message(chain_id, a.view, &a.block_hash),
+                    committee.dst_for_view(a.view),
+                ) {
                     return Err(EvidenceError::BadSignature(0));
                 }
-                if !b
-                    .sig
-                    .verify(key, &vote_message(chain_id, b.view, &b.block_hash))
-                {
+                if !b.sig.verify_with_dst(
+                    key,
+                    &vote_message(chain_id, b.view, &b.block_hash),
+                    committee.dst_for_view(b.view),
+                ) {
                     return Err(EvidenceError::BadSignature(1));
                 }
                 Ok(())
@@ -126,10 +128,18 @@ impl Equivocation {
                 let key = committee
                     .key(pa)
                     .map_err(|_| EvidenceError::UnknownValidator(pa))?;
-                if !a.sig.verify(key, &proposal_message(chain_id, &ha)) {
+                if !a.sig.verify_with_dst(
+                    key,
+                    &proposal_message(chain_id, &ha),
+                    committee.dst_for_view(a.block.header.view),
+                ) {
                     return Err(EvidenceError::BadSignature(0));
                 }
-                if !b.sig.verify(key, &proposal_message(chain_id, &hb)) {
+                if !b.sig.verify_with_dst(
+                    key,
+                    &proposal_message(chain_id, &hb),
+                    committee.dst_for_view(b.block.header.view),
+                ) {
                     return Err(EvidenceError::BadSignature(1));
                 }
                 Ok(())

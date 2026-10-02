@@ -169,7 +169,11 @@ impl AsRef<str> for ConsensusProtocol {
     }
 }
 
-#[async_trait]
+// ⚠ NO `#[async_trait]` HERE, DELIBERATELY. libp2p-request-response 0.30 (libp2p 0.57) declares
+// `Codec`'s methods as `-> impl Future<Output = ...> + Send` rather than boxing them, so the macro's
+// `Pin<Box<dyn Future + '_>>` desugaring no longer matches the trait and produces four E0195
+// "lifetime parameters or bounds do not match" errors. Plain `async fn` satisfies RPITIT natively.
+// `ConsensusTransport` below is OUR trait and still uses the macro.
 impl Codec for ConsensusCodec {
     type Protocol = ConsensusProtocol;
     type Request = ConsensusEnvelope;
@@ -804,6 +808,9 @@ async fn swarm_task(mut swarm: libp2p::Swarm<SolidusBehaviour>, args: SwarmTaskA
                         request_response::Event::Message {
                             peer,
                             message: request_response::Message::Request { request, channel, .. },
+                            // `connection_id` was added in libp2p 0.57; we key off `peer`, not the
+                            // individual connection, so it is deliberately ignored rather than bound.
+                            ..
                         }
                     )) => {
                         let from_index = request.from;

@@ -8,9 +8,12 @@ description = "Solidus v2 JSON-RPC edge: submit + query over committed state. Bi
 
 [dependencies]
 solidus-exec = { workspace = true }
+solidus-bridge-codec = { workspace = true }
 solidus-store2 = { workspace = true }
-solidus-txns = { workspace = true }
-solidus-crypto = { workspace = true }
+solidus-txns = { workspace = true, features = ["bbs"] }
+# "bbs" is needed for solidus_bbsVerifyProof. A feature flag on an existing
+# dependency, not a new crate.
+solidus-crypto = { workspace = true, features = ["bbs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }

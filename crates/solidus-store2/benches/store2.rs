@@ -69,7 +69,15 @@ fn bench_persist_block(c: &mut Criterion) {
                 },
                 |(store, _dir)| {
                     store
-                        .persist_block(1, [1u8; 32], b"block-bytes", &delta, &receipts)
+                        .persist_block(
+                            1,
+                            [1u8; 32],
+                            b"block-bytes",
+                            &delta,
+                            &receipts,
+                            &[],
+                            [[0u8; 32]; 4],
+                        )
                         .expect("persist")
                 },
                 BatchSize::PerIteration,

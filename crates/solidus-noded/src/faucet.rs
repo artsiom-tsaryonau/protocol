@@ -59,17 +59,37 @@ fn default_interval() -> u64 {
     3_600
 }
 
-/// Build and sign the drip Transfer (pure — unit-tested below).
-fn build_drip_tx(key: &SigningKey, nonce: u64, to: Address, amount: u64) -> Transaction {
+/// Build and sign the drip Transfer for `mode` (pure - unit-tested below).
+fn build_drip_tx(
+    key: &SigningKey,
+    nonce: u64,
+    to: Address,
+    amount: u64,
+    mode: WireMode,
+) -> Transaction {
     let mut tx = Transaction {
         sender_pubkey: key.verifying_key().to_bytes(),
         nonce,
         payload: TxPayload::Transfer { to, amount },
         signature: [0u8; 64],
     };
-    let msg = wire::signing_bytes(&tx, WireMode::BinaryV2);
+    let msg = wire::signing_bytes(&tx, mode);
     tx.signature = sign(key, &msg);
     tx
+}
+
+/// The signing wire the chain reports for its next block. A node older than
+/// bridge plan 01 reports no `wire`, and it verifies BinaryV2.
+pub(crate) fn wire_from_chain_info(info: &Value) -> std::result::Result<WireMode, String> {
+    match info.get("wire").and_then(Value::as_str) {
+        None | Some("binary-v2") => Ok(WireMode::BinaryV2),
+        Some("binary-v3") => info
+            .get("chainIdNumeric")
+            .and_then(Value::as_u64)
+            .map(|chain_id| WireMode::BinaryV3 { chain_id })
+            .ok_or_else(|| "chainInfo reports binary-v3 without chainIdNumeric".to_string()),
+        Some(other) => Err(format!("chainInfo reports an unknown wire: {other}")),
+    }
 }
 
 /// Per-address rate limiter (pure — the clock is injected so tests don't
@@ -118,6 +138,25 @@ fn rpc_err(code: i32, msg: String) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(code, msg, None::<()>)
 }
 
+/// The nonce a rejected drip should be rebuilt with, if it was rejected for its nonce.
+///
+/// ⛔ `solidus_submitTransaction` RETURNS BEFORE THE NONCE IS CHECKED. It accepts the
+/// transaction into the mempool; `executor.rs` compares `tx.nonce` against the account
+/// at EXECUTION. So a drip can be "submitted" and still fail, which is exactly what
+/// happened on 2026-09-24: every drip returned a hash and every receipt read
+/// `invalid nonce: expected N, got N-1`, because another transaction on the faucet
+/// account landed between the nonce fetch and execution. The lock around the handler
+/// could not prevent it: it is released when submit returns, and a nonce only advances
+/// when a block executes.
+///
+/// The executor's own message carries the value it wanted, so a loser can retry exactly
+/// once with it instead of guessing.
+fn nonce_to_retry(failure_reason: &str) -> Option<u64> {
+    let rest = failure_reason.strip_prefix("invalid nonce: expected ")?;
+    let (want, _got) = rest.split_once(", got ")?;
+    want.parse().ok()
+}
+
 async fn handle_drip(state: &FaucetState, params: &Value) -> Result<Value, ErrorObjectOwned> {
     let addr_str = params
         .as_array()
@@ -143,16 +182,66 @@ async fn handle_drip(state: &FaucetState, params: &Value) -> Result<Value, Error
         .await
         .map_err(|e| rpc_err(-32010, format!("upstream nonce query failed: {e}")))?;
 
-    let tx = build_drip_tx(&state.key, nonce, to, state.drip_amount);
-    #[allow(clippy::expect_used)] // fixed-shape serde struct; no error path
-    let hex_tx = hex::encode(bincode::serialize(&tx).expect("Transaction bincode"));
-    let tx_hash: String = state
+    let info: Value = state
         .client
-        .request("solidus_submitTransaction", rpc_params![hex_tx])
+        .request("solidus_chainInfo", rpc_params![])
         .await
-        .map_err(|e| rpc_err(-32010, format!("upstream submit failed: {e}")))?;
+        .map_err(|e| rpc_err(-32010, format!("upstream chainInfo query failed: {e}")))?;
+    let mode = wire_from_chain_info(&info).map_err(|e| rpc_err(-32010, e))?;
+    // ⛔ A SUBMITTED DRIP IS NOT A SUCCESSFUL DRIP. Confirm the receipt before saying so,
+    // and retry exactly once if the nonce went stale under us. See `nonce_to_retry`.
+    let mut next_nonce = nonce;
+    let mut last_failure = String::from("no receipt");
+    for attempt in 0..2 {
+        let tx = build_drip_tx(&state.key, next_nonce, to, state.drip_amount, mode);
+        #[allow(clippy::expect_used)] // fixed-shape serde struct; no error path
+        let hex_tx = hex::encode(bincode::serialize(&tx).expect("Transaction bincode"));
+        let tx_hash: String = state
+            .client
+            .request("solidus_submitTransaction", rpc_params![hex_tx])
+            .await
+            .map_err(|e| rpc_err(-32010, format!("upstream submit failed: {e}")))?;
 
-    Ok(json!({ "txHash": tx_hash, "amount": state.drip_amount.to_string() }))
+        let receipt = await_receipt(state, &tx_hash).await?;
+        if receipt.get("status").and_then(Value::as_str) == Some("success") {
+            return Ok(json!({
+                "txHash": tx_hash,
+                "amount": state.drip_amount.to_string(),
+                "blockHeight": receipt.get("blockHeight").cloned().unwrap_or(Value::Null),
+            }));
+        }
+        last_failure = receipt
+            .get("failureReason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        match nonce_to_retry(&last_failure) {
+            Some(want) if attempt == 0 => next_nonce = want,
+            _ => break,
+        }
+    }
+    Err(rpc_err(-32011, format!("drip failed: {last_failure}")))
+}
+
+/// Wait for a transaction's receipt. `solidus_getReceipt` answers `-32004 not found`
+/// until the transaction is executed, so a short poll is the whole mechanism. Blocks
+/// land about every 0.5 s; a drip that never lands is an error rather than a silent
+/// success, which is the bug this whole path exists to stop.
+async fn await_receipt(state: &FaucetState, tx_hash: &str) -> Result<Value, ErrorObjectOwned> {
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Ok(receipt) = state
+            .client
+            .request::<Value, _>("solidus_getReceipt", rpc_params![tx_hash])
+            .await
+        {
+            return Ok(receipt);
+        }
+    }
+    Err(rpc_err(
+        -32012,
+        format!("no receipt for {tx_hash} within 6s"),
+    ))
 }
 
 fn handle_info(state: &FaucetState) -> Value {
@@ -220,7 +309,7 @@ mod tests {
     fn drip_tx_is_well_formed_and_verifiable() {
         let key = generate_signing_key();
         let to = Address::from_bytes([7; 20]);
-        let tx = build_drip_tx(&key, 42, to, 1_000_000);
+        let tx = build_drip_tx(&key, 42, to, 1_000_000, WireMode::BinaryV2);
 
         assert_eq!(tx.nonce, 42);
         assert!(matches!(
@@ -278,5 +367,67 @@ mod tests {
         .expect("parse");
         assert_eq!(cfg.drip_amount, 1_000_000);
         assert_eq!(cfg.min_interval_secs, 3_600);
+    }
+
+    #[test]
+    fn drip_tx_verifies_only_under_the_wire_it_was_built_for() {
+        let key = generate_signing_key();
+        let to = Address::from_bytes([7; 20]);
+        let v3 = WireMode::BinaryV3 { chain_id: 50_002 };
+        let tx = build_drip_tx(&key, 1, to, 5, v3);
+        assert!(wire::verify_signature(&tx, v3));
+        assert!(!wire::verify_signature(&tx, WireMode::BinaryV2));
+        assert!(!wire::verify_signature(
+            &tx,
+            WireMode::BinaryV3 { chain_id: 50_003 }
+        ));
+    }
+
+    #[test]
+    fn the_signing_wire_is_read_from_chain_info() {
+        assert_eq!(
+            wire_from_chain_info(&json!({ "wire": "binary-v3", "chainIdNumeric": 50_002 })),
+            Ok(WireMode::BinaryV3 { chain_id: 50_002 })
+        );
+        assert_eq!(
+            wire_from_chain_info(&json!({ "wire": "binary-v2", "chainIdNumeric": 50_002 })),
+            Ok(WireMode::BinaryV2)
+        );
+        assert_eq!(
+            wire_from_chain_info(&json!({ "chain_id": "solidus-testnet" })),
+            Ok(WireMode::BinaryV2),
+            "a node older than this plan reports no wire"
+        );
+        assert!(wire_from_chain_info(&json!({ "wire": "binary-v3" }))
+            .unwrap_err()
+            .contains("chainIdNumeric"));
+        assert!(
+            wire_from_chain_info(&json!({ "wire": "binary-v9", "chainIdNumeric": 1 }))
+                .unwrap_err()
+                .contains("unknown wire")
+        );
+    }
+
+    /// ⛔ EVERY DRIP FAILED IN PRODUCTION ON 2026-09-24 AND THE FAUCET REPORTED SUCCESS.
+    /// `solidus_submitTransaction` returns a hash as soon as the tx is accepted into the
+    /// mempool, but the nonce is checked at EXECUTION. The old handler returned that hash
+    /// and never looked at the receipt, so a drip that failed with
+    /// `invalid nonce: expected 3, got 2` was indistinguishable from one that worked.
+    /// The executor's message carries the nonce it wanted, so a losing drip can say so.
+    #[test]
+    fn a_nonce_failure_reports_the_nonce_to_retry_with() {
+        assert_eq!(nonce_to_retry("invalid nonce: expected 3, got 2"), Some(3));
+        assert_eq!(nonce_to_retry("invalid nonce: expected 0, got 41"), Some(0));
+    }
+
+    #[test]
+    fn only_a_nonce_failure_is_retryable() {
+        assert_eq!(
+            nonce_to_retry("insufficient balance for fee: have 0, need 1"),
+            None
+        );
+        assert_eq!(nonce_to_retry(""), None);
+        // Shape-alike that is NOT the executor's nonce message.
+        assert_eq!(nonce_to_retry("invalid nonce: expected soon"), None);
     }
 }

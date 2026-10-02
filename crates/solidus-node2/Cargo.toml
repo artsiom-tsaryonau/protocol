@@ -7,13 +7,14 @@ repository.workspace = true
 description = "Solidus v2 integrated validator node: HotStuff-2 + DAG mempool + two-lane executor + store2 wired together, with the local multi-validator harness"
 
 [dependencies]
+solidus-rpc2 = { workspace = true }
 solidus-hotstuff2 = { workspace = true }
 solidus-mempool-dag = { workspace = true }
 solidus-exec = { workspace = true }
 solidus-store2 = { workspace = true }
 solidus-state-tree = { workspace = true }
 solidus-txns = { workspace = true }
-solidus-crypto = { workspace = true }
+solidus-crypto = { workspace = true, features = ["consensus"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
@@ -21,5 +22,7 @@ thiserror = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+solidus-subnet = { workspace = true }
+blst = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }

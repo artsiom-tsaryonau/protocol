@@ -68,13 +68,19 @@ async fn four_real_libp2p_nodes_commit_and_agree() {
     let funded: Vec<SigningKey> = (0..100).map(|_| generate_signing_key()).collect();
 
     // Build each runner: Node (store2 + seeded genesis) + swarm.
+    let mut tempdirs: Vec<tempfile::TempDir> = Vec::new();
     let mut runners: Vec<P2pRunner> = Vec::new();
     let executed: Arc<Mutex<Vec<Vec<Executed>>>> = Arc::new(Mutex::new(vec![Vec::new(); N]));
     let mut exec_rxs: Vec<mpsc::UnboundedReceiver<Executed>> = Vec::new();
 
     for i in 0..N {
+        // ⛔ OWNED, NOT LEAKED. `keep()` left one RocksDB store per validator
+        // per run on disk forever; 703 of them and 4.1 GB took this machine to
+        // zero free space on 2026-09-02, and at zero every shell command fails
+        // before it runs.
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Store2::open(&dir.keep(), Profile::Testnet).expect("store");
+        let store = Store2::open(dir.path(), Profile::Testnet).expect("store");
+        tempdirs.push(dir);
         let elector: Box<dyn LeaderElector> = Box::new(RoundRobin::new(N));
         let mut node = Node::new(
             i as u32,
@@ -90,9 +96,15 @@ async fn four_real_libp2p_nodes_commit_and_agree() {
                 batch_max_bytes: 256 * 1024,
                 batch_max_txs: 200,
                 flush_interval_ms: 25,
+                min_block_interval_ms: 0,
+                idle_heartbeat_ms: 0,
+                idle_grace_ms: 0,
+                view_timeout_ms: 0,
+                block_retention: 0, // pruning off: these tests assert on history
             },
             NETWORK.to_string(),
-        );
+        )
+        .expect("node boots");
         for key in &funded {
             let addr = Address::from_public_key(&key.verifying_key());
             let acct = Account::with_balance(addr, 1_000_000_000, AccountType::Regular);

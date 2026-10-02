@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-solidus-crypto.workspace = true
-solidus-txns.workspace = true
+solidus-crypto = { workspace = true, features = ["bbs", "consensus"] }
+solidus-txns = { workspace = true, features = ["bbs"] }
 solidus-state.workspace = true
 solidus-consensus.workspace = true
 jsonrpsee = { workspace = true, features = ["server", "macros"] }

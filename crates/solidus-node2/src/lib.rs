@@ -14,8 +14,13 @@
 //! outputs over tokio loopback channels and measures end-to-end
 //! throughput + finality on this box.
 
+pub mod bridge_evidence;
 pub mod config;
 pub mod node;
+pub mod sync;
 
 pub use config::{NodeTuning, TopologyConfig, ValidatorSpec};
-pub use node::{ExecAnchor, Node, NodeInput, NodeOutput};
+pub use node::{BlockAttestor, ExecAnchor, Node, NodeError, NodeInput, NodeOutput, SyncCounters};
+pub use sync::{
+    verify_fetched_range, SyncError, VerifiedRange, MAX_BLOCK_RANGE, MAX_RANGE_REPLY_BYTES,
+};

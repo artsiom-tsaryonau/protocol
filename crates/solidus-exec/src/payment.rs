@@ -216,6 +216,7 @@ mod tests {
             height: 1,
             timestamp_ms: 1_700_000_000_000,
             network: "testnet",
+            parent_state_root: [0u8; 32],
         }
     }
 

@@ -33,6 +33,13 @@ use crate::types::{
 const INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC error code for internal errors.
 const INTERNAL_ERROR: i32 = -32603;
+/// Application-defined error: the method exists and is disabled by node policy.
+///
+/// `-32000..=-32099` is the JSON-RPC range reserved for application errors, so this
+/// does not collide with `-32601 Method not found` — and it must not, because the
+/// method DOES exist. Reporting it as "not found" would be a lie a caller could
+/// reasonably act on.
+const POLICY_DISABLED: i32 = -32001;
 
 fn invalid_params(msg: impl Into<String>) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(INVALID_PARAMS, msg.into(), None::<()>)
@@ -40,6 +47,10 @@ fn invalid_params(msg: impl Into<String>) -> ErrorObjectOwned {
 
 fn internal_error(msg: impl Into<String>) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(INTERNAL_ERROR, msg.into(), None::<()>)
+}
+
+fn policy_disabled(msg: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(POLICY_DISABLED, msg.into(), None::<()>)
 }
 
 /// Best-effort resident set size of the current process, in bytes.
@@ -247,6 +258,25 @@ pub struct SolidusRpcImpl {
     /// so an idle consensus loop proposes immediately instead of waiting
     /// for its next tick. Harmless no-op when nothing is parked on it.
     pub tx_wake: Arc<tokio::sync::Notify>,
+    /// Whether `solidus_credentialsBySubject` may answer.
+    ///
+    /// **Defaults to `false`.** Subject enumeration is the strongest correlation
+    /// handle this node exposes: `subject_did` is written to the ledger in
+    /// plaintext beside a semantically loaded `credential_type` (`KycL3`, `Age`),
+    /// and this method turns that into a one-request lookup of everything a given
+    /// DID holds. Measured 2026-08-20: the node has **no P2P listener at all**
+    /// (`dev-testnet`, single socket `127.0.0.1:9944`), so the proxied JSON-RPC is
+    /// the only public door and closing it is a real mitigation rather than
+    /// theatre. Same posture as `rpc_listen`: secure by default, public by opt-in.
+    ///
+    /// ⚠ This is a MITIGATION, not the fix. The ledger still publishes the field;
+    /// the fix is removing `subject_did` from `CredentialIssue` altogether, which
+    /// is consensus-breaking and gated on a founder decision (BD-7 scope).
+    ///
+    /// ⚠ `solidus_credentialsByIssuer` is deliberately NOT gated. Issuer plus type
+    /// plus timestamp in aggregate is far weaker than a per-subject lookup, and
+    /// block explorers legitimately need it.
+    pub allow_subject_enumeration: bool,
 }
 
 impl SolidusRpcImpl {
@@ -275,7 +305,20 @@ impl SolidusRpcImpl {
             start_time: Instant::now(),
             tx_broadcast,
             tx_wake,
+            allow_subject_enumeration: false,
         }
+    }
+
+    /// Opt in to answering `solidus_credentialsBySubject`.
+    ///
+    /// A builder rather than an eighth positional argument to `new()`: the
+    /// constructor has four call sites and every future one would have to pass
+    /// the flag explicitly, which is how a secure default gets flipped by
+    /// accident. Callers that do not call this get the closed behaviour.
+    #[must_use]
+    pub fn with_subject_enumeration(mut self, allow: bool) -> Self {
+        self.allow_subject_enumeration = allow;
+        self
     }
 
     /// Load a block from the store by height.
@@ -543,6 +586,20 @@ impl SolidusApiServer for SolidusRpcImpl {
     }
 
     fn credentials_by_subject(&self, did: String) -> RpcResult<Vec<RpcCredentialRecord>> {
+        // Refuse rather than return an empty vector. `[]` would assert "this DID
+        // holds no credentials" — a statement the node never computed and which is
+        // false for most subjects. Same rule the BBS verify path follows: never
+        // report a result you did not compute. An error is also unambiguous to a
+        // caller, where an empty list silently looks like a successful query.
+        if !self.allow_subject_enumeration {
+            return Err(policy_disabled(concat!(
+                "solidus_credentialsBySubject is disabled on this node: enumerating ",
+                "every credential held by a subject DID is a correlation handle. ",
+                "Query a known credential by id with solidus_credentialVerify, or ",
+                "run a node with subject enumeration explicitly enabled.",
+            )));
+        }
+
         let ids = load_credential_ids(&self.store, CF_CRED_BY_SUBJECT, &did)
             .map_err(|e| internal_error(format!("store error: {e}")))?;
 
@@ -1223,6 +1280,7 @@ mod tests {
             id: "urn:solidus:credential:aabbcc".to_string(),
             issuer_did: "did:solidus:testnet:issuer".to_string(),
             subject_did: "did:solidus:testnet:subject".to_string(),
+            subject_commitment: None,
             credential_type: CredentialType::Email,
             hash: [0x11u8; 32],
             issued_ms: 1_700_000_000_000,
@@ -1251,17 +1309,134 @@ mod tests {
         assert_eq!(rpc_cred.hash, hex::encode([0x11u8; 32]));
     }
 
+    // ⚠ AN ORPHANED `#[test]` AND ITS DOC COMMENT WERE REMOVED HERE, 2026-08-23.
+    //
+    // A later edit inserted the doc comment and `#[test]` below BETWEEN an existing
+    // `#[test]` and its function, so two attributes stacked onto one test and the first
+    // annotated nothing. `cargo check --workspace` cannot see that: lib-tests are not
+    // built without `--all-targets`, and CI has been dark since 2026-08-08.
+    //
+    // The coverage it described is NOT lost, which is why nothing was restored: the
+    // refusal and its control both live below as
+    // `credentials_by_subject_*`, asserting a policy refusal that names the reason
+    // rather than an empty list. Checked before deleting.
+
+    /// ⛔ A v2 credential must be READABLE, or it is write-only and useless.
+    ///
+    /// The holder's whole path is: receive `(subject_did, nonce)` off-chain, read the
+    /// record back, recompute `BLAKE3(domain ‖ did ‖ nonce)` and compare it to what the
+    /// chain served. **If the RPC does not serve `subject_commitment`, there is nothing
+    /// to compare against** and the credential can never be proved. That is exactly what
+    /// happened: `RpcCredentialRecord` whitelists its fields, so adding the field to the
+    /// chain record did not expose it here, and the gap was silent.
     #[test]
-    fn credentials_by_subject_empty() {
+    fn v2_record_serves_the_commitment_so_a_holder_can_verify() {
+        use solidus_txns::credential::build_subject_commitment;
+
+        let commitment = build_subject_commitment("did:solidus:testnet:alice", &[0x5a; 32]);
+        let cred = solidus_txns::credential::execute_credential_issue_v2(
+            "did:solidus:testnet:issuer",
+            commitment,
+            solidus_txns::credential::CredentialType::KycL3,
+            [0x11; 32],
+            true,
+            42,
+            1_700_000_000_000,
+        )
+        .expect("issue");
+
+        let rpc_rec = RpcCredentialRecord::from_credential(&cred);
+
+        // The holder can recompute and compare.
+        assert_eq!(
+            rpc_rec.subject_commitment.as_deref(),
+            Some(hex::encode(commitment).as_str()),
+            "the commitment must reach the caller"
+        );
+        // And the subject itself still does not.
+        assert!(rpc_rec.subject_did.is_empty());
+        let json = serde_json::to_string(&rpc_rec).expect("serialize");
+        assert!(
+            !json.contains("alice"),
+            "the subject must not be served: {json}"
+        );
+
+        // CONTROL: a v1 record serves the DID and NO commitment, so the assertions above
+        // are reading the v2 shape rather than a field that is always set or always empty.
+        let v1 = solidus_txns::credential::execute_credential_issue(
+            "did:solidus:testnet:issuer",
+            "did:solidus:testnet:alice",
+            solidus_txns::credential::CredentialType::KycL3,
+            [0x11; 32],
+            true,
+            true,
+            42,
+            1_700_000_000_000,
+        )
+        .expect("v1 issue");
+        let v1_rec = RpcCredentialRecord::from_credential(&v1);
+        assert_eq!(v1_rec.subject_did, "did:solidus:testnet:alice");
+        assert_eq!(v1_rec.subject_commitment, None);
+    }
+
+    #[test]
+    fn credentials_by_subject_is_refused_by_default() {
         let (store, _dir) = open_tmp();
         let rpc = make_rpc(store);
+        assert!(
+            !rpc.allow_subject_enumeration,
+            "the secure default must be closed; if this flips, the gate is decorative"
+        );
+
+        let err = SolidusApiServer::credentials_by_subject(
+            &rpc,
+            "did:solidus:testnet:nobody".to_string(),
+        )
+        .expect_err("subject enumeration must not answer on a default node");
+
+        assert_eq!(err.code(), POLICY_DISABLED, "must not masquerade as -32601");
+        assert_ne!(
+            err.code(),
+            INTERNAL_ERROR,
+            "a policy refusal is not a node fault"
+        );
+        assert!(
+            err.message().contains("correlation handle"),
+            "the refusal must say WHY, got: {}",
+            err.message()
+        );
+    }
+
+    /// CONTROL for the test above. A gate that refuses everything proves nothing;
+    /// this shows the same call succeeds once the node opts in, so the refusal is
+    /// attributable to the flag and not to a broken code path.
+    #[test]
+    fn credentials_by_subject_answers_when_explicitly_enabled() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store).with_subject_enumeration(true);
 
         let result = SolidusApiServer::credentials_by_subject(
             &rpc,
             "did:solidus:testnet:nobody".to_string(),
         )
-        .unwrap();
-        assert!(result.is_empty(), "unknown DID should return empty list");
+        .expect("an opted-in node must answer");
+        assert!(result.is_empty(), "unknown DID returns an empty list");
+    }
+
+    /// The issuer index is deliberately NOT gated, and this pins that decision.
+    /// Issuer + type + timestamp in aggregate is far weaker than a per-subject
+    /// lookup, and explorers need it. If someone gates it later, this test tells
+    /// them it was a choice rather than an oversight.
+    #[test]
+    fn credentials_by_issuer_is_not_gated() {
+        let (store, _dir) = open_tmp();
+        let rpc = make_rpc(store);
+        assert!(!rpc.allow_subject_enumeration, "still the closed default");
+
+        let result =
+            SolidusApiServer::credentials_by_issuer(&rpc, "did:solidus:testnet:issuer".to_string())
+                .expect("issuer lookup stays open on a default node");
+        assert!(result.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1579,6 +1754,7 @@ mod tests {
             id: "urn:solidus:credential:legacy".to_string(),
             issuer_did: "did:solidus:testnet:issuer".to_string(),
             subject_did: "did:solidus:testnet:subject".to_string(),
+            subject_commitment: None,
             credential_type: CredentialType::Email,
             hash: [0u8; 32],
             issued_ms: 1_000,
@@ -1628,6 +1804,7 @@ mod tests {
             id: "urn:solidus:credential:bbs-test".to_string(),
             issuer_did: "did:solidus:testnet:issuer".to_string(),
             subject_did: "did:solidus:testnet:alice".to_string(),
+            subject_commitment: None,
             credential_type: CredentialType::KycL2,
             hash: [0xAA; 32],
             issued_ms: 1_700_000_000_000,
@@ -1686,6 +1863,7 @@ mod tests {
             id: "urn:solidus:credential:bbs-revoked".to_string(),
             issuer_did: "did:solidus:testnet:issuer".to_string(),
             subject_did: "did:solidus:testnet:alice".to_string(),
+            subject_commitment: None,
             credential_type: CredentialType::KycL1,
             hash: [0; 32],
             issued_ms: 1_000,

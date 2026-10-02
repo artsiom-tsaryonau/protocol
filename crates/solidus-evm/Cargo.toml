@@ -9,8 +9,8 @@ description = "Solidus v2 EVM subnet: REVM + 3 identity precompiles reading L1-f
 [dependencies]
 solidus-subnet = { workspace = true }
 solidus-state-tree = { workspace = true }
-solidus-crypto = { workspace = true }
-solidus-txns = { workspace = true }
+solidus-crypto = { workspace = true, features = ["bbs"] }
+solidus-txns = { workspace = true, features = ["bbs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }

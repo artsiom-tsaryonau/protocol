@@ -52,6 +52,7 @@ fn compute_payloads_fail_softly_fee_debited_nonce_advanced() {
         height: 1,
         timestamp_ms: GENESIS_TS + 1_000,
         network: NETWORK,
+        parent_state_root: [0u8; 32],
     };
     let outcome = execute_block_reference(&state, &txs, &ctx, &opts).expect("execute block 1");
 
@@ -76,6 +77,7 @@ fn compute_payloads_fail_softly_fee_debited_nonce_advanced() {
         height: 2,
         timestamp_ms: GENESIS_TS + 2_000,
         network: NETWORK,
+        parent_state_root: [0u8; 32],
     };
     let outcome = execute_block_reference(&state, &txs, &ctx, &opts).expect("execute block 2");
     assert_eq!(outcome.receipts[0].status, TxStatus::Success);

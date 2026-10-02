@@ -7,7 +7,7 @@ repository.workspace = true
 description = "HotStuff-2 (2-chain) BFT consensus for Solidus v2: pure event-driven core, sub-second pacemaker, gossip-shaped dissemination"
 
 [dependencies]
-solidus-crypto = { workspace = true }
+solidus-crypto = { workspace = true, features = ["consensus"] }
 solidus-mempool-dag = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
@@ -15,6 +15,10 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+blst = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+bincode = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]

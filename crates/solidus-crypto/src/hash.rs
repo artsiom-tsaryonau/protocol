@@ -68,6 +68,19 @@ mod tests {
         assert_eq!(h.len(), 20);
     }
 
+    /// Value-asserting golden vector — `hash160_is_20_bytes` above only ever
+    /// checked the LENGTH, never the VALUE. That gap is exactly how
+    /// `docs/protocol.md`'s formerly-wrong `RIPEMD-160(BLAKE3-256(data))`
+    /// formula went unnoticed against this function's real behavior
+    /// (truncated BLAKE3, no RIPEMD anywhere). This test locks the value so
+    /// the spec can't drift again silently.
+    #[test]
+    fn hash160_matches_known_vector() {
+        const FIXED_INPUT: &[u8] = b"solidus-hash160-test-vector-v1";
+        let got = hex::encode(hash160(FIXED_INPUT));
+        assert_eq!(got, "4384b9ff31cf1c42f97a2bf638547f8f7784ddc1");
+    }
+
     #[test]
     fn hash160_deterministic() {
         let data = b"solidus address";

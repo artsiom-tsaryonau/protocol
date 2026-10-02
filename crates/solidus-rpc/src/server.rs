@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use http::{header, HeaderValue, Method};
 use jsonrpsee::server::{Server, ServerHandle};
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 
 use solidus_consensus::mempool::Mempool;
 use solidus_consensus::types::ValidatorIdentity;
@@ -90,6 +90,28 @@ pub async fn start_rpc_server(
     let local_addr = server.local_addr()?;
     info!("JSON-RPC server listening on {local_addr}");
 
+    // Subject enumeration is opt-in via the environment rather than a parameter.
+    // `start_rpc_server` has six call sites, five of them tests, and threading a
+    // bool through all of them is how a secure default gets passed wrong once and
+    // never noticed. An env var also lets an operator open it without a rebuild,
+    // which is what makes the refusal message ("run a node with subject
+    // enumeration explicitly enabled") a true statement rather than a dead end.
+    //
+    // Anything other than exactly "1" or "true" leaves it closed, including the
+    // empty string, so a blank entry in a unit file does not silently open it.
+    let allow_subject_enumeration = std::env::var("SOLIDUS_RPC_ALLOW_SUBJECT_ENUMERATION")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+    if allow_subject_enumeration {
+        warn!(
+            "solidus_credentialsBySubject is ENABLED: any caller can enumerate every \
+             credential held by a given subject DID. Intended for local development."
+        );
+    }
+
     let rpc_impl = SolidusRpcImpl::new(
         store,
         mempool,
@@ -98,7 +120,8 @@ pub async fn start_rpc_server(
         chain_meta,
         tx_broadcast,
         tx_wake,
-    );
+    )
+    .with_subject_enumeration(allow_subject_enumeration);
     let handle = server.start(rpc_impl.into_rpc());
 
     Ok((handle, local_addr))

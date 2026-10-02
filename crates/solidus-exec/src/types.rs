@@ -121,6 +121,9 @@ pub enum WireMode {
     LegacyJson,
     /// v2 format: BLAKE3 over bincode payload/envelope (R-WIRE pin).
     BinaryV2,
+    /// V2 rules (bridge): v2 bytes with a domain prefix and the numeric chain id,
+    /// so a signature from one chain never verifies on another (spec §6.2 replay).
+    BinaryV3 { chain_id: u64 },
 }
 
 /// Which canonical order the block's transactions execute in.
@@ -158,12 +161,36 @@ pub struct BlockCtx<'a> {
     pub height: u64,
     pub timestamp_ms: u64,
     pub network: &'a str,
+    /// Global state root before this block. Consensus-agreed: the node passes
+    /// its forest root, which every honest node computes identically.
+    pub parent_state_root: [u8; 32],
+}
+
+impl BlockCtx<'_> {
+    /// Which execution rules govern THIS block.
+    ///
+    /// ⛔ DERIVED FROM `height` AND NOTHING ELSE, and it must stay that way.
+    /// Two nodes that disagree about the rule set at the same height fork, and
+    /// the disagreement stays invisible until their state roots differ. There is
+    /// deliberately no way to pass a version in: it is not an input, it is a
+    /// consequence of where the block sits in the chain.
+    ///
+    /// ⚠ There is no signature change anywhere for this. `height` was already
+    /// on the context, so every executor and handler can ask without being
+    /// rewired, which is what makes threading the version a no-op refactor
+    /// rather than a churn of call sites.
+    #[must_use]
+    pub fn protocol_version(&self) -> crate::protocol::ProtocolVersion {
+        crate::protocol::version_at(self.height)
+    }
 }
 
 /// Full execution options for a block run.
 #[derive(Debug, Clone)]
 pub struct ExecOptions {
     pub wire: WireMode,
+    /// Numeric chain id (the header's `chain_id`). Bound into V3 signatures.
+    pub chain_id: u64,
     pub order: ExecOrder,
     pub fee_policy: FeePolicy,
     pub identity_cap: usize,
@@ -171,9 +198,13 @@ pub struct ExecOptions {
 
 impl ExecOptions {
     /// v2 chain defaults: binary wire, lane-partitioned order, burn fees.
-    pub fn v2_defaults() -> Self {
+    ///
+    /// `wire` is the pre-V2 mode; executors derive the effective mode per block
+    /// with [`crate::wire::wire_for_height`].
+    pub fn v2_defaults(chain_id: u64) -> Self {
         Self {
             wire: WireMode::BinaryV2,
+            chain_id,
             order: ExecOrder::LanePartitioned,
             fee_policy: FeePolicy::Burn,
             identity_cap: DEFAULT_IDENTITY_CAP,
@@ -184,6 +215,7 @@ impl ExecOptions {
     pub fn legacy_anchor(treasury: Address, validators: Vec<Address>) -> Self {
         Self {
             wire: WireMode::LegacyJson,
+            chain_id: 0,
             order: ExecOrder::RawBlock,
             fee_policy: FeePolicy::LegacyDistribute {
                 treasury,
@@ -191,5 +223,21 @@ impl ExecOptions {
             },
             identity_cap: usize::MAX,
         }
+    }
+}
+
+#[cfg(test)]
+mod block_ctx_tests {
+    use super::*;
+
+    #[test]
+    fn block_ctx_carries_the_parent_state_root() {
+        let ctx = BlockCtx {
+            height: 1,
+            timestamp_ms: 2,
+            network: "testnet",
+            parent_state_root: [9; 32],
+        };
+        assert_eq!(ctx.parent_state_root, [9; 32]);
     }
 }

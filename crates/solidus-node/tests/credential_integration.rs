@@ -244,27 +244,49 @@ async fn issue_credential_and_verify_via_rpc() {
     );
 
     // -----------------------------------------------------------------------
-    // 8. Query via RPC solidus_credentialsBySubject
+    // 8. solidus_credentialsBySubject is REFUSED on a default node
     // -----------------------------------------------------------------------
-    let by_subject_result: Vec<serde_json::Value> = client
-        .request(
+    // This step used to assert the opposite: that the method returns the subject's
+    // full credential list. It was rewritten rather than deleted when subject
+    // enumeration was gated (2026-08-20), because the end-to-end path is still
+    // worth covering — what changed is which answer is correct.
+    //
+    // The step's real purpose (the issued credential is queryable and correct) is
+    // preserved below via solidus_credentialVerify, which takes a credential id
+    // the caller must already possess and so is not an enumeration handle.
+    let by_subject_err = client
+        .request::<Vec<serde_json::Value>, _>(
             "solidus_credentialsBySubject",
             rpc_params![subject_did.clone()],
         )
         .await
-        .expect("solidus_credentialsBySubject failed");
+        .expect_err("subject enumeration must be refused unless explicitly enabled");
 
-    assert_eq!(
-        by_subject_result.len(),
-        1,
-        "should have exactly one credential for this subject"
+    let err_text = by_subject_err.to_string();
+    assert!(
+        err_text.contains("correlation handle"),
+        "the refusal must explain itself, got: {err_text}"
     );
+    assert!(
+        !err_text.contains("Method not found"),
+        "must not masquerade as an unknown method; it exists and is disabled: {err_text}"
+    );
+
+    // CONTROL: the refusal above is policy, not a broken RPC path. The same client
+    // on the same server still gets a real answer for a credential it names.
+    let verified: serde_json::Value = client
+        .request(
+            "solidus_credentialVerify",
+            rpc_params![credential_id.clone()],
+        )
+        .await
+        .expect("solidus_credentialVerify must still answer");
     assert_eq!(
-        by_subject_result[0]["id"], credential_id,
+        verified["credential"]["id"], credential_id,
         "credential id should match"
     );
     assert_eq!(
-        by_subject_result[0]["revoked"], false,
+        verified["revoked"], false,
         "credential should not be revoked"
     );
 

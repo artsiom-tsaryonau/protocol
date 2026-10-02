@@ -2,7 +2,7 @@
 //! (§4.6 — serde_json never enters the v2 hot path).
 
 use serde::{Deserialize, Serialize};
-use solidus_crypto::bls::{BlsPublicKey, BlsSignature};
+use solidus_crypto::bls::{BlsPublicKey, BlsSignature, DST_BASIC, DST_POP_SIG};
 use solidus_crypto::hash::blake3_hash;
 use solidus_mempool_dag::BatchCertificate;
 
@@ -20,14 +20,72 @@ pub type ValidatorIndex = u32;
 /// The validator committee for an epoch: BLS public keys addressed by
 /// [`ValidatorIndex`]. Stage-1 scope: a static committee; epoch rotation
 /// from the staking tree lands with node2.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CommitteeError {
+    #[error("{keys} keys but {pops} proofs of possession")]
+    PopCountMismatch { keys: usize, pops: usize },
+    #[error("proof of possession for validator {0} does not verify")]
+    InvalidPop(ValidatorIndex),
+}
+
+/// The DST a vote, timeout or proposal at `view` is signed and verified under.
+pub fn vote_dst_for_view(view: View, pop_activation_view: View) -> &'static [u8] {
+    if view >= pop_activation_view {
+        DST_POP_SIG
+    } else {
+        DST_BASIC
+    }
+}
+
 #[derive(Clone)]
 pub struct Committee {
     keys: Vec<BlsPublicKey>,
+    pop_activation_view: View,
 }
 
 impl Committee {
+    /// Legacy constructor: the PoP suite never activates. Kept for existing tests and tools.
     pub fn new(keys: Vec<BlsPublicKey>) -> Self {
-        Self { keys }
+        Self {
+            keys,
+            pop_activation_view: View::MAX,
+        }
+    }
+
+    /// Production constructor: every key must carry a valid proof of possession.
+    pub fn new_with_pops(
+        keys: Vec<BlsPublicKey>,
+        pops: Vec<BlsSignature>,
+    ) -> Result<Self, CommitteeError> {
+        Self::with_pop_activation(keys, pops, crate::params::POP_ACTIVATION_VIEW)
+    }
+
+    /// Test and simulation constructor with an explicit activation view.
+    pub fn with_pop_activation(
+        keys: Vec<BlsPublicKey>,
+        pops: Vec<BlsSignature>,
+        pop_activation_view: View,
+    ) -> Result<Self, CommitteeError> {
+        if keys.len() != pops.len() {
+            return Err(CommitteeError::PopCountMismatch {
+                keys: keys.len(),
+                pops: pops.len(),
+            });
+        }
+        for (i, (k, p)) in keys.iter().zip(&pops).enumerate() {
+            if !k.verify_possession(p) {
+                return Err(CommitteeError::InvalidPop(i as ValidatorIndex));
+            }
+        }
+        Ok(Self {
+            keys,
+            pop_activation_view,
+        })
+    }
+
+    /// The ciphersuite tag for a signature at `view`.
+    pub fn dst_for_view(&self, view: View) -> &'static [u8] {
+        vote_dst_for_view(view, self.pop_activation_view)
     }
 
     pub fn len(&self) -> usize {
@@ -220,6 +278,7 @@ impl QuorumCert {
             &self.signers,
             &self.agg_sig,
             &vote_message(chain_id, self.view, &self.block_hash),
+            committee.dst_for_view(self.view),
         )
         .map_err(|e| ConsensusError::InvalidQc(e.to_string()))
     }
@@ -249,6 +308,7 @@ impl TimeoutCert {
             &self.signers,
             &self.agg_sig,
             &timeout_message(chain_id, self.view),
+            committee.dst_for_view(self.view),
         )
         .map_err(|e| ConsensusError::InvalidTc(e.to_string()))?;
         self.high_qc.verify(chain_id, committee, genesis_hash)
@@ -264,6 +324,7 @@ fn verify_aggregate(
     signers: &[ValidatorIndex],
     agg_sig: &BlsSignature,
     msg: &[u8; 32],
+    dst: &[u8],
 ) -> Result<(), ConsensusError> {
     if signers.windows(2).any(|w| w[0] >= w[1]) {
         return Err(ConsensusError::InvalidQc(
@@ -281,7 +342,7 @@ fn verify_aggregate(
     for &idx in signers {
         pks.push(committee.key(idx)?);
     }
-    if !agg_sig.fast_aggregate_verify(&pks, msg) {
+    if !agg_sig.fast_aggregate_verify_with_dst(&pks, msg, dst) {
         return Err(ConsensusError::InvalidQc(
             "aggregate signature verification failed".to_string(),
         ));

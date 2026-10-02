@@ -20,7 +20,7 @@ tracing = { workspace = true }
 futures = "0.3"
 
 [dev-dependencies]
-solidus-crypto = { workspace = true }
+solidus-crypto = { workspace = true, features = ["consensus"] }
 solidus-exec = { workspace = true }
 solidus-store2 = { workspace = true }
 ed25519-dalek = { workspace = true }

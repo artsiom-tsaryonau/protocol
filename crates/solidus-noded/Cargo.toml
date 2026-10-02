@@ -17,7 +17,13 @@ solidus-rpc2 = { workspace = true }
 solidus-store2 = { workspace = true }
 solidus-exec = { workspace = true }
 solidus-hotstuff2 = { workspace = true }
-solidus-crypto = { workspace = true }
+# Needed only to count a block's transactions for the RPC edge: a v2 block
+# carries batch_certs, so the count lives in the batch bodies, not the block.
+solidus-mempool-dag = { workspace = true }
+solidus-crypto = { workspace = true, features = ["consensus", "attest"] }
+# The §3.2 digest and its EIP-191 framing. `no_std`, so this is the same code the phase 8 ZK
+# guest links and the same code that generates test-fixtures/bridge/attestation-v2.json.
+solidus-bridge-codec = { workspace = true }
 solidus-txns = { workspace = true }
 tokio = { workspace = true }
 libp2p = { workspace = true }

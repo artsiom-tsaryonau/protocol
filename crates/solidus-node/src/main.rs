@@ -85,6 +85,14 @@ enum Commands {
         /// RPC port for the primary validator (validator-0).
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
+        /// RPC bind host for the primary validator. Defaults to loopback-only
+        /// (matches prior hardcoded behavior — no change for existing callers).
+        /// Container/compose use (e.g. local devnet) must pass 0.0.0.0
+        /// explicitly to be reachable via Docker's port mapping / from other
+        /// containers on the same network — Docker's port forwarding targets
+        /// the container's own interface, not its loopback.
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_host: String,
     },
     /// Print the libp2p PeerId derived from a node.key file.
     PeerId {
@@ -164,8 +172,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::DevTestnet {
             testnet_dir,
             rpc_port,
+            rpc_host,
         }) => {
-            run_dev_testnet(&testnet_dir, rpc_port).await?;
+            run_dev_testnet(&testnet_dir, rpc_port, &rpc_host).await?;
         }
         Some(Commands::PeerId { key }) => {
             println!("{}", peer_id_from_key_file(Path::new(&key))?);
@@ -1347,7 +1356,11 @@ async fn handle_block_by_hash_by_peer(
 // Dev testnet: all validators in one process
 // ---------------------------------------------------------------------------
 
-async fn run_dev_testnet(testnet_dir: &str, rpc_port: u16) -> Result<(), Box<dyn Error>> {
+async fn run_dev_testnet(
+    testnet_dir: &str,
+    rpc_port: u16,
+    rpc_host: &str,
+) -> Result<(), Box<dyn Error>> {
     let testnet_path = Path::new(testnet_dir);
 
     // 1. Load genesis
@@ -1480,7 +1493,7 @@ async fn run_dev_testnet(testnet_dir: &str, rpc_port: u16) -> Result<(), Box<dyn
     // 9. Start RPC server (exposes validator-0's state). Pass the in-process
     // committee so `solidus_getValidators` reflects live voters even though
     // dev-testnet has no on-chain staking transactions.
-    let rpc_addr: SocketAddr = format!("127.0.0.1:{rpc_port}").parse()?;
+    let rpc_addr: SocketAddr = format!("{rpc_host}:{rpc_port}").parse()?;
     let (rpc_handle, actual_rpc_addr) = start_rpc_server(
         rpc_addr,
         Arc::clone(&store),
@@ -1953,7 +1966,7 @@ async fn run_consensus_loop(
                 let round = engine.pacemaker.current_round();
                 info!(round = round, "pacemaker timeout — broadcasting timeout vote");
 
-                let sig = engine.bls_sk.sign(format!("timeout_{round}").as_bytes());
+                let sig = engine.bls_sk.sign(&TimeoutVote::signing_bytes(round));
                 let tv = TimeoutVote {
                     round,
                     voter_index: engine.node_index,
@@ -2270,9 +2283,18 @@ async fn handle_consensus_message(
                 "received proposal"
             );
 
-            // Update QC state from the justify QC.
+            // Update QC state from the justify QC. A proposal is one of the
+            // three ways a QC arrives from the network, so its justify_qc gets
+            // the same signature check as a relayed one; an unverifiable
+            // justify_qc is dropped and the proposal is still evaluated on its
+            // own merits, which is the safe direction (no lock movement).
             if let Some(ref qc) = justify_qc {
-                engine.on_new_qc(qc);
+                if !engine.on_new_qc(qc) {
+                    warn!(
+                        round = qc.round,
+                        "proposal carried a justify_qc that does not verify"
+                    );
+                }
             }
 
             // Execute the block's transactions BEFORE voting. The
@@ -2515,7 +2537,18 @@ async fn apply_qc(
     latest_height: &Arc<Mutex<u64>>,
     qc: &solidus_consensus::types::QuorumCertificate,
 ) {
-    engine.on_new_qc(qc);
+    // Everything below this line acts on the QC: it moves the lock, finalises
+    // blocks through the 3-chain rule, advances the round and can trigger a
+    // proposal. None of it may run for a QC whose aggregate signature does not
+    // verify against its own signer set.
+    if !engine.on_new_qc(qc) {
+        warn!(
+            round = qc.round,
+            signer_count = qc.signer_count(),
+            "ignoring unverifiable QC: no commit, no round advance"
+        );
+        return;
+    }
 
     // Attempt 3-chain commit.
     let committed = engine.try_commit();

@@ -132,6 +132,44 @@ pub enum TxPayload {
         /// Number of messages signed.
         bbs_message_count: u32,
     },
+    /// Issue a credential WITHOUT publishing the subject's DID (Rebuild #2 BD-6b).
+    ///
+    /// The v1 variants above write `subject_did` to a public ledger in plaintext.
+    /// Measured 2026-08-20: that is not merely readable, it is **served** by
+    /// `solidus_credentialsBySubject`, indexed by subject in the state store, and
+    /// republished in `Event::CredentialIssued`. Worse, `build_credential_id` hashes
+    /// the subject together with inputs that are ALL public (issuer from the sender,
+    /// `hash` from the payload, height from the block), so the id is a confirmation
+    /// oracle at one BLAKE3 per candidate DID, and every DID reaches the chain in a
+    /// public `DidCreate`. See `credential_id_leaks_the_subject_by_brute_force`.
+    ///
+    /// Here the subject reaches the chain only as
+    /// `BLAKE3(SUBJECT_COMMITMENT_DOMAIN ‖ subject_did ‖ nonce32)`. The issuer draws
+    /// the nonce from a CSPRNG once per credential and hands `(subject_did, nonce)` to
+    /// the holder off-chain with the credential. **The 32 bytes of per-credential
+    /// entropy are what defeat the oracle**, not the hash itself.
+    ///
+    /// ⚠ `credential_type` STAYS, and the reason is product rather than consensus.
+    /// Issuance is fee-exempt in both executors, so the per-type fee schedule never
+    /// runs and cannot be the justification. It stays because the record flows
+    /// `recordToVC` → `vc.type[]` → identity's trust score, which matches on
+    /// `credType`. Against a high-entropy commitment the type is an aggregate fact
+    /// about an ISSUER, not a fact about a person.
+    ///
+    /// ⚠ ACCEPTED ONLY BY THE v2 EXECUTOR. `solidus-txns` is shared, so the type
+    /// exists on both chains; the acceptance boundary is in the executors, and the
+    /// live v1 executor rejects this variant. That is the version discriminant, placed
+    /// at the chain rather than at the type.
+    CredentialIssueV2 {
+        /// Commitment to the subject DID. See [`build_subject_commitment`].
+        ///
+        /// [`build_subject_commitment`]: crate::credential::build_subject_commitment
+        subject_commitment: [u8; 32],
+        /// The type of credential being issued.
+        credential_type: CredentialType,
+        /// BLAKE3 hash of the off-chain credential payload.
+        hash: [u8; 32],
+    },
     /// Revoke a previously issued credential. Only the original issuer may do this.
     CredentialRevoke {
         /// The unique credential identifier to revoke.
@@ -178,6 +216,27 @@ pub enum TxPayload {
         reputation_penalty: u64,
         severe: bool,
     },
+    /// GOVERNANCE (bridge): an action approved by compiled governor keys. V2 only.
+    BridgeGovernance {
+        action: crate::bridge::BridgeGovAction,
+        gov_nonce: u64,
+        approvals: Vec<crate::bridge::GovernorApproval>,
+    },
+    /// Issuer exports one of its credentials to a destination chain, with the holder's consent. V2 only.
+    ExportCredential {
+        credential_id: String,
+        domain: u32,
+        holder: [u8; 32],
+        valid_until: u64,
+        consent_sig: Vec<u8>,
+        consent_expiry: u64,
+    },
+    /// Issuer removes an export at the holder's request. V2 only.
+    UnexportCredential {
+        credential_id: String,
+        domain: u32,
+        holder: [u8; 32],
+    },
 }
 
 impl TxPayload {
@@ -194,6 +253,13 @@ impl TxPayload {
             TxPayload::CredentialIssueBbs {
                 credential_type, ..
             } => credential_type.issue_fee_bbs(),
+            // Same schedule as v1. ⚠ Neither executor ever reads this for a credential
+            // payload: `is_fee_exempt` covers issuance in both, so the fee is 0 and this
+            // arm is unreachable in practice. It exists so `fee()` stays total, and it
+            // mirrors v1 rather than inventing a second schedule nobody charges.
+            TxPayload::CredentialIssueV2 {
+                credential_type, ..
+            } => credential_type.issue_fee(),
             TxPayload::CredentialRevoke { .. } => FEE_CREDENTIAL_REVOKE,
             TxPayload::Stake { .. } => FEE_STAKE,
             TxPayload::Unstake { .. } => FEE_UNSTAKE,
@@ -203,6 +269,10 @@ impl TxPayload {
             | TxPayload::ComputeRegister { .. }
             | TxPayload::ComputeAnchor { .. }
             | TxPayload::ComputeSlash { .. } => FEE_COMPUTE,
+            // Fee-exempt in both executors (issuer anchors are value-free); total for completeness.
+            TxPayload::BridgeGovernance { .. }
+            | TxPayload::ExportCredential { .. }
+            | TxPayload::UnexportCredential { .. } => 0,
         }
     }
 }
@@ -300,6 +370,17 @@ pub enum Event {
         issuer: String,
         subject: String,
     },
+    /// A credential was issued WITHOUT publishing the subject (BD-6b, v2 only).
+    ///
+    /// A separate variant rather than hex in `CredentialIssued.subject`, because a
+    /// field that is sometimes a DID and sometimes a commitment is the kind of thing
+    /// a reader gets wrong once and silently. The type keeps them apart.
+    CredentialIssuedV2 {
+        credential_id: String,
+        issuer: String,
+        /// Commitment to the subject. Reveals nothing without the issuer's nonce.
+        subject_commitment: [u8; 32],
+    },
     /// A credential was revoked by its issuer.
     CredentialRevoked { credential_id: String },
     /// A validator staked tokens.
@@ -339,6 +420,29 @@ pub enum Event {
         operator: Address,
         severe: bool,
         reputation: u64,
+    },
+    /// A bridge domain was registered or re-registered by governance.
+    BridgeDomainRegistered { domain: u32, enabled: bool },
+    /// A bridge trust root was set or cleared by governance.
+    BridgeTrustRootSet { did: String, enabled: bool },
+    /// A credential was exported to a destination domain.
+    CredentialExported {
+        credential_id: String,
+        domain: u32,
+        export_id: [u8; 32],
+    },
+    /// A credential export was removed.
+    CredentialUnexported {
+        credential_id: String,
+        domain: u32,
+        export_id: [u8; 32],
+    },
+    /// A bridge message was queued; `message_id` is keccak256 of the message body.
+    BridgeMessageQueued {
+        domain: u32,
+        domain_seq: u64,
+        kind: u8,
+        message_id: [u8; 32],
     },
 }
 
@@ -472,6 +576,32 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded: TxPayload = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, decoded);
+    }
+
+    /// Regression for the 2026-07-13 live failure: the published
+    /// agent-identity SDK submits CredentialIssueBbs txs whose
+    /// `credential_type` is the snake_case wire string ("owner_binding"),
+    /// and the RPC rejected the whole transaction JSON with
+    /// `unknown variant`. The payload must parse with the alias form.
+    #[test]
+    fn bbs_credential_payload_parses_sdk_snake_case_type() {
+        let json = serde_json::json!({
+            "CredentialIssueBbs": {
+                "subject_did": "did:solidus:testnet:agent",
+                "credential_type": "owner_binding",
+                "hash": vec![0xAB_u8; 32],
+                "bbs_pubkey": vec![0xCD_u8; 96],
+                "bbs_message_count": 4
+            }
+        })
+        .to_string();
+        let decoded: TxPayload = serde_json::from_str(&json).expect("snake_case type must parse");
+        match decoded {
+            TxPayload::CredentialIssueBbs {
+                credential_type, ..
+            } => assert_eq!(credential_type, CredentialType::OwnerBinding),
+            other => panic!("wrong payload variant: {other:?}"),
+        }
     }
 
     #[test]
