@@ -14,7 +14,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends clang libclang-dev cmake \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-# rust-toolchain.toml pins the nightly channel; install it in its own layer.
+# rust-toolchain.toml pins the toolchain; install it in its own layer.
 COPY rust-toolchain.toml ./
 RUN rustup toolchain install
 COPY . .
