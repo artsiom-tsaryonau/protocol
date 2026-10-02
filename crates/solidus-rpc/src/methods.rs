@@ -119,6 +119,12 @@ pub trait SolidusApi {
     #[method(name = "solidus_blockNumber")]
     fn block_number(&self) -> RpcResult<u64>;
 
+    /// Liveness for probes: `{"status":"ok","height":N}`. Also served as
+    /// `GET /health` (see `start_rpc_server`), because Kubernetes and load
+    /// balancer probes cannot speak POST JSON-RPC.
+    #[method(name = "solidus_health")]
+    fn health(&self) -> RpcResult<serde_json::Value>;
+
     /// Return chain metadata: id, native token, genesis hash, latest height,
     /// and node version. Wallets, explorers, indexers, and listing
     /// aggregators hit this to confirm the chain self-describes correctly.
@@ -490,6 +496,14 @@ impl SolidusApiServer for SolidusRpcImpl {
             internal_error("internal error")
         })?;
         Ok(height)
+    }
+
+    fn health(&self) -> RpcResult<serde_json::Value> {
+        let height = *self.latest_height.lock().map_err(|e| {
+            error!("latest_height lock poisoned: {e}");
+            internal_error("internal error")
+        })?;
+        Ok(serde_json::json!({ "status": "ok", "height": height }))
     }
 
     fn chain_info(&self) -> RpcResult<RpcChainInfo> {

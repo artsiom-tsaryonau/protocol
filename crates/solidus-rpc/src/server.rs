@@ -81,7 +81,15 @@ pub async fn start_rpc_server(
     tx_broadcast: Option<tokio::sync::mpsc::UnboundedSender<Transaction>>,
     tx_wake: Arc<tokio::sync::Notify>,
 ) -> Result<(ServerHandle, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
-    let middleware = tower::ServiceBuilder::new().layer(rpc_cors_layer());
+    // GET /health -> solidus_health, so HTTP probes work against a POST-only
+    // JSON-RPC server.
+    let health = jsonrpsee::server::middleware::http::ProxyGetRequestLayer::new(
+        "/health",
+        "solidus_health",
+    )?;
+    let middleware = tower::ServiceBuilder::new()
+        .layer(rpc_cors_layer())
+        .layer(health);
     let server = Server::builder()
         .set_http_middleware(middleware)
         .build(listen_addr)
@@ -135,6 +143,41 @@ pub async fn start_rpc_server(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // GET /health (2026-10-03): an external review running the node in
+    // Kubernetes found the RPC is POST-only JSON-RPC, so probes could only fall
+    // back to a TCP check that passes even when the node is wedged.
+    #[tokio::test]
+    async fn get_health_returns_ok_and_height() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempdir().expect("tempdir");
+        let store = Arc::new(Store::open(dir.path()).expect("store"));
+        let (handle, local_addr) = start_rpc_server(
+            "127.0.0.1:0".parse().unwrap(),
+            store,
+            Arc::new(Mutex::new(Mempool::new())),
+            Arc::new(Mutex::new(7u64)),
+            Arc::new(Vec::new()),
+            ChainMeta::default(),
+            None,
+            Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .expect("server should start");
+
+        let mut sock = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+        sock.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        sock.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "status line: {resp}");
+        assert!(resp.contains("\"status\":\"ok\""), "body: {resp}");
+        assert!(resp.contains("\"height\":7"), "body: {resp}");
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
 
     #[tokio::test]
     async fn server_starts_and_stops() {

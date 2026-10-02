@@ -93,6 +93,11 @@ enum Commands {
         /// the container's own interface, not its loopback.
         #[arg(long, default_value = "127.0.0.1")]
         rpc_host: String,
+        /// Directory for the chain database. Defaults to `<testnet-dir>/dev-data`
+        /// (prior behaviour). Set it to keep keys read-only (e.g. a Kubernetes
+        /// Secret) and the database on a separate writable volume.
+        #[arg(long)]
+        data_dir: Option<String>,
     },
     /// Print the libp2p PeerId derived from a node.key file.
     PeerId {
@@ -173,8 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             testnet_dir,
             rpc_port,
             rpc_host,
+            data_dir,
         }) => {
-            run_dev_testnet(&testnet_dir, rpc_port, &rpc_host).await?;
+            run_dev_testnet(&testnet_dir, rpc_port, &rpc_host, data_dir.as_deref()).await?;
         }
         Some(Commands::PeerId { key }) => {
             println!("{}", peer_id_from_key_file(Path::new(&key))?);
@@ -389,15 +395,17 @@ async fn run_consensus_node(config_path: &str) -> Result<(), Box<dyn Error>> {
 
     // Apply genesis balances: build the legacy GenesisConfig from the GenesisFile
     // so that the existing genesis loading logic can be reused.
-    let treasury_address_str = genesis_file
-        .initial_balances
-        .iter()
-        .find(|(_, &bal)| bal == 50_000_000 * 100_000_000)
-        .map(|(addr, _)| addr.clone())
-        .unwrap_or_else(|| {
-            // Fallback: use the first validator address
-            genesis_file.validators[0].address.clone()
-        });
+    let treasury_address_str = genesis_file.treasury_or_else(|g| {
+        // Legacy guess for genesis files without `treasury_address`.
+        g.initial_balances
+            .iter()
+            .find(|(_, &bal)| bal == 50_000_000 * 100_000_000)
+            .map(|(addr, _)| addr.clone())
+            .unwrap_or_else(|| {
+                // Fallback: use the first validator address
+                g.validators[0].address.clone()
+            })
+    });
 
     let validator_address_strs: Vec<String> = genesis_file
         .validators
@@ -639,12 +647,14 @@ async fn run_full_node(config_path: &str) -> Result<(), Box<dyn Error>> {
     let store = Arc::new(Store::open(&data_dir)?);
     info!(data_dir = %data_dir.display(), "opened store");
 
-    let treasury_address_str = genesis_file
-        .initial_balances
-        .iter()
-        .find(|(_, &bal)| bal == 50_000_000 * 100_000_000)
-        .map(|(addr, _)| addr.clone())
-        .unwrap_or_else(|| genesis_file.validators[0].address.clone());
+    let treasury_address_str = genesis_file.treasury_or_else(|g| {
+        // Legacy guess for genesis files without `treasury_address`.
+        g.initial_balances
+            .iter()
+            .find(|(_, &bal)| bal == 50_000_000 * 100_000_000)
+            .map(|(addr, _)| addr.clone())
+            .unwrap_or_else(|| g.validators[0].address.clone())
+    });
 
     let validator_address_strs: Vec<String> = genesis_file
         .validators
@@ -1356,10 +1366,20 @@ async fn handle_block_by_hash_by_peer(
 // Dev testnet: all validators in one process
 // ---------------------------------------------------------------------------
 
+/// Where dev-testnet keeps its database: `--data-dir` when given, otherwise
+/// `<testnet-dir>/dev-data` (unchanged default).
+fn dev_data_dir(testnet_path: &Path, data_dir: Option<&str>) -> std::path::PathBuf {
+    match data_dir {
+        Some(d) => std::path::PathBuf::from(d),
+        None => testnet_path.join("dev-data"),
+    }
+}
+
 async fn run_dev_testnet(
     testnet_dir: &str,
     rpc_port: u16,
     rpc_host: &str,
+    data_dir: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let testnet_path = Path::new(testnet_dir);
 
@@ -1377,16 +1397,18 @@ async fn run_dev_testnet(
     let committee_arc = Arc::new(validators.clone());
 
     // 4. Open store and apply genesis (shared by all validators in dev mode)
-    let data_dir = testnet_path.join("dev-data");
+    let data_dir = dev_data_dir(testnet_path, data_dir);
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(Store::open(&data_dir)?);
 
-    let treasury_address_str = genesis_file
-        .initial_balances
-        .keys()
-        .find(|k| !genesis_file.validators.iter().any(|v| v.address == **k))
-        .cloned()
-        .unwrap_or_default();
+    let treasury_address_str = genesis_file.treasury_or_else(|g| {
+        // Legacy guess for genesis files without `treasury_address`.
+        g.initial_balances
+            .keys()
+            .find(|k| !g.validators.iter().any(|v| v.address == **k))
+            .cloned()
+            .unwrap_or_default()
+    });
 
     let validator_address_strs: Vec<String> = genesis_file
         .validators
@@ -1899,6 +1921,7 @@ async fn run_consensus_loop(
     // Initial proposal attempt — the first leader should propose immediately
     // (suppressed when there is no work; the heartbeat covers liveness).
     try_propose_if_leader(engine, transport, false).await;
+    drain_self_qcs(engine, transport, &latest_height).await;
 
     // Empty-block suppression state. While idle the pacemaker deadline is
     // NOT armed — otherwise an idle chain degenerates into a timeout/TC
@@ -1908,6 +1931,9 @@ async fn run_consensus_loop(
     let mut was_idle = false;
 
     loop {
+        // n == 1: apply any QC this node formed from its own vote since the
+        // last turn (no-op for larger committees).
+        drain_self_qcs(engine, transport, &latest_height).await;
         let idle = !engine.has_proposable_work();
         if idle != was_idle {
             if idle {
@@ -2579,6 +2605,24 @@ async fn apply_qc(
 /// Uses round-robin leader election: leader = round % num_validators.
 /// This is deterministic — all nodes agree on the leader without exchanging VRF proofs.
 /// VRF-based election is used for verification of proposals in production (libp2p mode).
+/// Apply QCs this node formed from its own vote (single-validator committee),
+/// one at a time, exactly as a QC formed from peer votes is applied in the
+/// `VoteMsg` handler: `apply_qc`, then broadcast `NewQC`. `apply_qc` may propose
+/// again and refill the slot, so this loops; it stops when the empty-block gate
+/// in `try_propose_if_leader` finds no work. Iteration, not recursion.
+async fn drain_self_qcs(
+    engine: &mut HotStuffEngine,
+    transport: &mut impl ConsensusTransport,
+    latest_height: &Arc<Mutex<u64>>,
+) {
+    while let Some(qc) = engine.pending_self_qc.take() {
+        apply_qc(engine, transport, latest_height, &qc).await;
+        if let Err(e) = transport.broadcast(ConsensusMessage::NewQC(qc)).await {
+            warn!(error = %e, "failed to broadcast self-formed QC");
+        }
+    }
+}
+
 async fn try_propose_if_leader(
     engine: &mut HotStuffEngine,
     transport: &mut impl ConsensusTransport,
@@ -2630,11 +2674,14 @@ async fn try_propose_if_leader(
         // quorum-1 peer votes (the proposer counts itself, like every replica).
         // Analogue of record_own_timeout_vote on the pacemaker path. For n >= 2
         // this buffers the vote and returns None (1 < quorum); the QC then forms
-        // when peer votes arrive via the VoteMsg handler. (n == 1 would return a
-        // QC here, but single-validator self-commit is intentionally not driven
-        // from this path to avoid a propose->commit->propose recursion.)
+        // when peer votes arrive via the VoteMsg handler. For n == 1 the own
+        // vote already forms the QC: it is parked in `pending_self_qc` and
+        // applied by `drain_self_qcs` from the event loop, NOT here, which
+        // avoids a propose -> apply_qc -> propose recursion.
         if let Some(vote) = engine.validate_and_vote(&block) {
-            let _ = engine.record_own_vote(vote);
+            if let Some(qc) = engine.record_own_vote(vote) {
+                engine.pending_self_qc = Some(qc);
+            }
         }
 
         // Track our own proposal for 3-chain commit, symmetric with the
@@ -2784,6 +2831,112 @@ fn load_genesis_validators(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One validator, quorum 1, backed by a leaked tempdir store.
+    fn solo_engine() -> HotStuffEngine {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(solidus_state::store::Store::open(dir.path()).expect("store"));
+        std::mem::forget(dir);
+        let ed_sk = solidus_crypto::ed25519::generate_signing_key();
+        let bls_sk = solidus_crypto::bls::BlsSecretKey::generate();
+        let validators = vec![solidus_consensus::types::ValidatorIdentity {
+            address: Address::from_public_key(&ed_sk.verifying_key()),
+            ed25519_pubkey: ed_sk.verifying_key().to_bytes(),
+            bls_pubkey: bls_sk.public_key(),
+        }];
+        let config = solidus_consensus::hotstuff::HotStuffConfig {
+            max_block_txs: 100,
+            quorum_threshold: 1,
+            treasury_address: Address::from_bytes([0xAAu8; 20]),
+            skip_vrf: true,
+        };
+        HotStuffEngine::new(
+            0,
+            ed_sk,
+            bls_sk,
+            validators,
+            store,
+            Arc::new(Mutex::new(solidus_consensus::mempool::Mempool::new())),
+            config,
+        )
+    }
+
+    // n = 1 self-commit (2026-10-03). With one validator the proposer's own vote
+    // already forms the QC, but try_propose_if_leader discarded it to avoid a
+    // propose -> apply_qc -> propose recursion, so a lone validator never
+    // advanced. The QC must now be applied, iteratively, by drain_self_qcs.
+    #[tokio::test]
+    async fn single_validator_applies_its_own_qc() {
+        let mut engine = solo_engine();
+        let mut net = solidus_p2p::channel::create_channel_network(1);
+        let mut transport = net.remove(0);
+        let latest = Arc::new(Mutex::new(0u64));
+        let round0 = engine.pacemaker.current_round();
+
+        try_propose_if_leader(&mut engine, &mut transport, true).await;
+        drain_self_qcs(&mut engine, &mut transport, &latest).await;
+
+        assert!(engine.highest_qc.is_some(), "own QC was not applied");
+        assert!(
+            engine.pacemaker.current_round() > round0,
+            "round did not advance past {round0}"
+        );
+    }
+
+    // The reported symptom was "a one-validator chain never COMMITS". HotStuff's
+    // 3-chain rule needs three consecutive QCs before the first block commits;
+    // forced heartbeats give a lone validator that chain.
+    #[tokio::test]
+    async fn single_validator_commits_after_three_chained_qcs() {
+        let mut engine = solo_engine();
+        let mut net = solidus_p2p::channel::create_channel_network(1);
+        let mut transport = net.remove(0);
+        let latest = Arc::new(Mutex::new(0u64));
+        for _ in 0..4 {
+            try_propose_if_leader(&mut engine, &mut transport, true).await;
+            drain_self_qcs(&mut engine, &mut transport, &latest).await;
+        }
+        assert!(
+            engine.last_committed_height >= 1,
+            "lone validator committed nothing (height {})",
+            engine.last_committed_height
+        );
+    }
+
+    // --data-dir (2026-10-03): an external Kubernetes review found dev-testnet
+    // writes its database INSIDE the directory holding the validator keys
+    // (`<testnet-dir>/dev-data`), so keys cannot be a read-only Secret with
+    // data on a separate volume.
+    #[test]
+    fn dev_testnet_accepts_data_dir_flag() {
+        let cli = Cli::try_parse_from([
+            "solidus-node",
+            "dev-testnet",
+            "--testnet-dir",
+            "/keys",
+            "--data-dir",
+            "/var/lib/solidus",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Commands::DevTestnet { data_dir, .. }) => {
+                assert_eq!(data_dir.as_deref(), Some("/var/lib/solidus"))
+            }
+            _ => panic!("expected dev-testnet"),
+        }
+    }
+
+    #[test]
+    fn dev_data_dir_defaults_inside_testnet_dir_and_honours_override() {
+        assert_eq!(
+            dev_data_dir(Path::new("/keys"), None),
+            std::path::PathBuf::from("/keys/dev-data")
+        );
+        assert_eq!(
+            dev_data_dir(Path::new("/keys"), Some("/var/lib/solidus")),
+            std::path::PathBuf::from("/var/lib/solidus")
+        );
+    }
 
     #[test]
     fn peer_id_from_key_file_round_trips() {

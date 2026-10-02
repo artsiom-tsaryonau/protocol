@@ -27,6 +27,23 @@ pub struct GenesisFile {
     pub validators: Vec<GenesisValidator>,
     pub initial_balances: HashMap<String, u64>,
     pub params: GenesisParams,
+    /// The treasury account, named explicitly. Optional so older genesis files
+    /// still parse; when absent, callers fall back to their legacy guess
+    /// (see [`GenesisFile::treasury_or_else`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treasury_address: Option<String>,
+}
+
+impl GenesisFile {
+    /// The treasury address: the explicit `treasury_address` field when present,
+    /// otherwise `legacy(self)`. Keeping the legacy rule as a caller-supplied
+    /// fallback means no existing chain changes its treasury on upgrade.
+    pub fn treasury_or_else(&self, legacy: impl FnOnce(&Self) -> String) -> String {
+        match &self.treasury_address {
+            Some(t) => t.clone(),
+            None => legacy(self),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +230,7 @@ node_index = {i}
         round_seed: round_seed_hex,
         validators,
         initial_balances,
+        treasury_address: Some(treasury_address.clone()),
         params,
     };
 
@@ -299,6 +317,50 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    // Explicit treasury (2026-10-03). Before this the node GUESSED the treasury:
+    // `run` took whichever account held exactly 50M SLDS, `dev-testnet` took the
+    // first non-validator balance. A genesis with any other balance silently fell
+    // back to validator 0. An external review flagged it.
+    fn genesis_json(extra: &str) -> String {
+        format!(
+            r#"{{"chain_id":"t","native_token":{{"symbol":"SLDS","name":"Solidus","decimals":8}},
+            "timestamp":"0","round_seed":"00","validators":[],
+            "initial_balances":{{"BIG":5000000000000000,"OTHER":1}},
+            "params":{{"block_time_ms":2000,"committee_size":1,"quorum_threshold":1,"round_timeout_ms":2000,"max_block_txs":10}}{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn explicit_treasury_wins_over_the_legacy_guess() {
+        let g: GenesisFile =
+            serde_json::from_str(&genesis_json(r#","treasury_address":"OTHER""#)).unwrap();
+        assert_eq!(g.treasury_or_else(|_| "LEGACY".to_string()), "OTHER");
+    }
+
+    #[test]
+    fn genesis_without_treasury_field_still_parses_and_uses_the_fallback() {
+        let g: GenesisFile = serde_json::from_str(&genesis_json("")).unwrap();
+        assert!(g.treasury_address.is_none());
+        assert_eq!(g.treasury_or_else(|_| "LEGACY".to_string()), "LEGACY");
+    }
+
+    #[test]
+    fn generated_genesis_names_its_treasury_explicitly() {
+        let dir = tempdir().unwrap();
+        generate_genesis(4, dir.path(), "solidus-testnet-1").unwrap();
+        let g: GenesisFile =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("genesis.json")).unwrap())
+                .unwrap();
+        let t = g
+            .treasury_address
+            .clone()
+            .expect("treasury_address written");
+        assert_eq!(
+            g.initial_balances.get(&t),
+            Some(&(50_000_000 * 100_000_000))
+        );
+    }
 
     #[test]
     fn generate_4_validator_genesis() {

@@ -400,8 +400,10 @@ mod tests {
     #[test]
     fn quorum_matches_bft_math() {
         // (n, expected quorum): n=4→3 (f=1), n=21→14 (f=6, live threshold),
-        // n=7→5 (f=2), n=10→7 (f=3).
-        for (n, q) in [(4usize, 3usize), (7, 5), (10, 7), (21, 14)] {
+        // n=7→5 (f=2), n=10→7 (f=3). n=1→1 (f=0): a lone validator's own
+        // vote is a quorum, so a single-validator chain can commit (pinned
+        // 2026-10-03 after the v1 node was found not to drive that case).
+        for (n, q) in [(1usize, 1usize), (4, 3), (7, 5), (10, 7), (21, 14)] {
             let (_, c) = committee_of(n);
             assert_eq!(c.quorum(), q, "n={n}");
             // Sanity: two quorums always intersect in ≥ f+1.

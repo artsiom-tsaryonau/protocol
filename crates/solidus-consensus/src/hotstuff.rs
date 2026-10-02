@@ -95,6 +95,11 @@ pub struct HotStuffEngine {
     pub locked_qc: Option<QuorumCertificate>,
     /// The highest QC this node has seen.
     pub highest_qc: Option<QuorumCertificate>,
+    /// A QC this node formed from its OWN vote (only possible when its vote
+    /// alone reaches quorum, i.e. a single-validator committee). The node's
+    /// event loop applies it on its next turn rather than inline, which avoids
+    /// a propose -> apply_qc -> propose recursion. `None` otherwise.
+    pub pending_self_qc: Option<QuorumCertificate>,
     /// The height of the last committed block.
     pub last_committed_height: u64,
     /// Hash of the last committed block (the finalized tip). [0;32] until first commit.
@@ -150,6 +155,7 @@ impl HotStuffEngine {
             pacemaker: Pacemaker::new(0),
             locked_qc: None,
             highest_qc: None,
+            pending_self_qc: None,
             last_committed_height: 0,
             last_committed_hash: [0u8; 32],
             pending_votes: HashMap::new(),
