@@ -1,8 +1,15 @@
 # Running solidus-node in a container
 
-A single-validator private chain: one HotStuff validator with a committee of one
-(`quorum_threshold = 1`), RPC on 9944, state in a persistent volume. This is the
-shape for a lab or a private identity anchor; it is not a public-network setup.
+A private lab chain in one container. Verified 2026-10-02 with podman:
+
+| Mode | Commits blocks | Survives restart | RPC reachable from other pods |
+|------|----------------|------------------|-------------------------------|
+| `dev-testnet` (4 validators in one process) | Yes (~1 s after a tx) | Yes (height kept, keeps committing) | **No** — RPC bound to `127.0.0.1` (needs a `--rpc-listen` option) |
+| `run --consensus`, 1 validator | **No** — QCs form but self-commit is not driven for n = 1 (see `try_propose_if_leader`) | — | Yes (`rpc_listen`) |
+| `run` (legacy, no `--consensus`) — from code, not run | Likely | **No** — proposer restarts at height 0 and overwrites stored blocks | Yes |
+
+Until one of those gaps is closed, `dev-testnet` is the mode that behaves like a chain;
+the steps below show the single-validator config shape for when n = 1 self-commit lands.
 
 ## 1. Build
 
