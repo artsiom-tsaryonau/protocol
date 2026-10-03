@@ -6,7 +6,7 @@ A private lab chain in one container. Verified 2026-10-02 with podman; reconcile
 | Mode | Commits blocks | Survives restart | RPC reachable from other pods |
 |------|----------------|------------------|-------------------------------|
 | `dev-testnet` (4 validators in one process) | Yes (~1 s after a tx) | Yes (height kept, keeps committing) | Pass **`--rpc-host 0.0.0.0`** (default is `127.0.0.1`); optional **`--data-dir /data`** for keys vs DB split |
-| `run --consensus`, 1 validator | Yes (upstream 2026-10-03) | Yes (`data_dir` on PVC) | Yes (`rpc_listen` in config) |
+| `run --consensus`, 1 validator | Yes (verified on image `a996880` by `scripts/smoke-container.sh`, 2026-10-03) | Yes (`data_dir` on PVC) | Yes (`rpc_listen` in config) |
 | `run` (legacy, no `--consensus`) — from code, not run | Likely | **No** — proposer restarts at height 0 and overwrites stored blocks | Yes |
 
 For Kubernetes, prefer **`run --consensus`** with one validator when you want a single pod;

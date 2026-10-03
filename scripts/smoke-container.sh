@@ -5,6 +5,24 @@ IMAGE="${1:?usage: smoke-container.sh <image>}"
 CHAIN="$(mktemp -d)"
 trap 'podman rm -f solidus-smoke-n1 solidus-smoke-dt solidus-smoke-dt-peer 2>/dev/null; rm -rf "$CHAIN"' EXIT
 
+# Health and chainInfo answer on a node that never commits, so each mode also sends one
+# faucet transfer and waits for the committed height to move (idle heartbeat is 10 min).
+assert_commits() {  # <rpc port> <genesis dir>
+  local port="$1" dir="$2" to tx height=0
+  to="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["validators"][0]["address"])' "$dir/genesis.json")"
+  tx="$(podman run --rm --user 0 -v "$dir:/g:ro,Z" --entrypoint solidus-node "$IMAGE" \
+    sign-transfer --key /g/faucet.key --to "$to" --amount 1 --nonce 0)"
+  python3 -c 'import json,sys; print(json.dumps({"jsonrpc":"2.0","id":1,"method":"solidus_sendTransaction","params":[sys.argv[1]]}))' "$tx" |
+    curl -sf -X POST "http://127.0.0.1:$port" -H 'Content-Type: application/json' -d @- | grep -q '"result"'
+  for _ in $(seq 1 30); do
+    height="$(curl -sf "http://127.0.0.1:$port/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["height"])')"
+    [ "$height" -ge 1 ] && { echo "   committed: height $height"; return 0; }
+    sleep 1
+  done
+  echo "FAIL: height still $height 30 s after a transfer on :$port" >&2
+  return 1
+}
+
 echo "== build check: $IMAGE"
 podman run --rm "$IMAGE" --help >/dev/null
 
@@ -38,6 +56,7 @@ done
 curl -sf -X POST "http://127.0.0.1:19944" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"solidus_chainInfo","params":[]}' | grep -q solidus-smoke-1
 curl -sf "http://127.0.0.1:19944/health" | grep -q '"status":"ok"'
+assert_commits 19944 "$CHAIN"
 podman stop -t 25 solidus-smoke-n1 >/dev/null
 
 echo "== dev-testnet RPC on 0.0.0.0"
@@ -55,6 +74,7 @@ for i in $(seq 1 30); do curl -sf "http://127.0.0.1:19945/health" >/dev/null && 
 curl -sf -X POST "http://127.0.0.1:19945" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"solidus_chainInfo","params":[]}' | grep -q solidus-smoke-dt
 curl -sf "http://127.0.0.1:19945/health" | grep -q '"status":"ok"'
+assert_commits 19945 "$CHAIN/dt"
 podman stop -t 25 solidus-smoke-dt >/dev/null
 
 echo "OK: smoke passed"
